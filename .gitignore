@@ -1,0 +1,54 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 运行时 / 知识库构建产物（可重新生成） =====
+knowledge_graph.json
+logs/
+memory.db
+eval/results/
+
+# ===== 数据源 =====
+# 知识源文件（data/src PDF、data/raw markdown）默认提交以重建知识库；
+# 若含大文件或敏感资料，取消下面注释以忽略 data/
+ data/
+
+# ===== 环境变量 / 密钥 =====
+.env
+.env.local
+.env.*
+!.env.example
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code 本地配置
+.claude/settings.local.json
+.claude/
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+
+#CLAUDE.md
+任务描述.md
+docs/法律问答系统(llm-wiki)

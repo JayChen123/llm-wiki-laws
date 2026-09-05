@@ -1,0 +1,17 @@
+/* ---- 隐藏搜索功能 ---- */
+.md-header__button[for="__search"],
+.md-search {
+  display: none !important;
+}
+
+/* ---- 页头 Logo（搜索框位置） ---- */
+.itheima-header-logo {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  padding-right: 0.6rem;
+}
+.itheima-header-logo img {
+  height: 36px;
+  max-height: 36px;
+}

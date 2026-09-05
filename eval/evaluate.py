@@ -1,0 +1,249 @@
+"""评估主程序：遍历测试用例，运行检索+生成，计算 recall@k 与 ragas 指标。
+
+用法：
+    uv run python -m eval.evaluate                     # 全量评估（30条，较慢）
+    uv run python -m eval.evaluate --limit 3           # 快速试跑 3 条
+    uv run python -m eval.evaluate --skip-ragas        # 仅计算 recall@k，不跑 ragas
+
+指标映射（ragas 0.2.x）：
+    recall@k            → 自定义，见 eval/metrics.py
+    上下文相关性         → context_utilization
+    上下文精确率         → context_precision
+    上下文召回率         → context_recall
+    答案相关性           → answer_relevancy
+    忠实度               → faithfulness
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+
+from app.config import DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, LLM_MODEL
+from app.generation.answer import AnswerGenerator
+from app.kb import KnowledgeBase
+from eval.metrics import recall_report
+
+CASES_PATH = Path(__file__).parent / "qa_test_cases.jsonl"
+RESULTS_DIR = Path(__file__).parent / "results"
+
+
+def load_cases(path: Path = CASES_PATH) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def build_rows(
+    cases: list[dict],
+    kb: KnowledgeBase,
+    gen: AnswerGenerator | None,
+    top_k: int,
+) -> tuple[list[dict], list[dict]]:
+    """对每条用例执行检索与生成，返回 (ragas 数据行, recall 明细)。"""
+    from tqdm import tqdm
+
+    rows: list[dict] = []
+    recalls: list[dict] = []
+    pbar = tqdm(cases, desc="检索+生成", unit="条", ncols=100)
+    for case in pbar:
+        pbar.set_postfix_str(f"{case['id']} 检索…")
+        results = kb.search(case["question"], top_k=top_k)
+        pbar.set_postfix_str(f"{case['id']} 命中{len(results)}块 生成…")
+        contexts = [
+            f"{r.get('source', '').split('.md')[0].strip()}·{r['title']}\n{r['content']}"
+            if ".md" in r.get("source", "")
+            else f"{r['title']}\n{r['content']}"
+            for r in results
+        ]
+        retrieved_ids = [r["id"] for r in results]
+        # 检索返回 top_k 基础块 + 图谱扩展块，生成器取全部（<=8）；@8 反映真实上下文
+        recall = recall_report(retrieved_ids, case["expected_knowledge"], ks=(1, 3, 5, 8))
+
+        answer = ""
+        gen_ok = False
+        if gen is not None:
+            try:
+                answer = gen.generate(case["question"], results, history=[])
+                gen_ok = True
+            except Exception as e:
+                pbar.write(f"  [!] {case['id']} 生成失败: {e}")
+        pbar.set_postfix_str(f"{case['id']} recall@1={recall['recall@1']}")
+
+        rows.append({
+            "case_id": case["id"],
+            "type": case["type"],
+            "user_input": case["question"],
+            "response": answer,
+            "retrieved_contexts": contexts,
+            "reference": case["answer"],
+            "gen_ok": gen_ok,
+        })
+        recalls.append({"id": case["id"], "type": case["type"], **recall})
+    return rows, recalls
+
+
+def build_llm():
+    from langchain_openai import ChatOpenAI
+    from ragas.llms import LangchainLLMWrapper
+
+    return LangchainLLMWrapper(
+        ChatOpenAI(
+            model=LLM_MODEL,
+            base_url=DASHSCOPE_BASE_URL,
+            api_key=DASHSCOPE_API_KEY,
+            temperature=0,
+        )
+    )
+
+
+def build_embeddings():
+    """DashScope 原生 embedding（text-embedding-v3），经 langchain 包装适配 ragas。"""
+    from langchain_community.embeddings import DashScopeEmbeddings
+    from ragas.embeddings import LangchainEmbeddingsWrapper
+
+    return LangchainEmbeddingsWrapper(
+        DashScopeEmbeddings(
+            model="text-embedding-v3",
+            dashscope_api_key=DASHSCOPE_API_KEY,
+        )
+    )
+
+
+def run_ragas(rows: list[dict], llm, embeddings) -> dict:
+    """运行 5 项 ragas 指标，返回 {指标: {avg, min, max, by_type}}。"""
+    from datasets import Dataset
+    from ragas import evaluate
+    from ragas.metrics import (
+        ContextRelevance,
+        answer_relevancy,
+        context_precision,
+        context_recall,
+        faithfulness,
+    )
+
+    metrics = [
+        context_precision,
+        context_recall,
+        ContextRelevance(llm=llm),
+        answer_relevancy,
+        faithfulness,
+    ]
+    valid = [r for r in rows if r["gen_ok"]]
+    if not valid:
+        return {"error": "无成功生成的样本，跳过 ragas 指标"}
+
+    names = [m.name for m in metrics]
+    print(f"  [ragas] 待计算指标（{len(names)} 项，样本 {len(valid)} 条）：{', '.join(names)}")
+    dataset = Dataset.from_dict({
+        "user_input": [r["user_input"] for r in valid],
+        "response": [r["response"] for r in valid],
+        "retrieved_contexts": [r["retrieved_contexts"] for r in valid],
+        "reference": [r["reference"] for r in valid],
+    })
+    result = evaluate(dataset=dataset, metrics=metrics, llm=llm, embeddings=embeddings)
+    df = result.to_pandas()
+
+    import pandas as pd
+
+    metric_names = [m.name for m in metrics]
+    summary: dict = {}
+    for name in metric_names:
+        col = pd.to_numeric(df[name], errors="coerce")
+        good = col.dropna()
+        by_type: dict[str, float] = {}
+        for idx, val in col.items():
+            if pd.notna(val):
+                t = valid[idx]["type"]
+                by_type.setdefault(t, []).append(round(float(val), 4))
+        summary[name] = {
+            "avg": round(float(good.mean()), 4) if not good.empty else None,
+            "min": round(float(good.min()), 4) if not good.empty else None,
+            "max": round(float(good.max()), 4) if not good.empty else None,
+            "failed_count": int(col.isna().sum()),
+            "by_type": {
+                t: round(sum(v) / len(v), 4) for t, v in by_type.items()
+            },
+        }
+
+    per_case = {}
+    for idx in range(len(valid)):
+        case_vals = {}
+        for name in metric_names:
+            val = pd.to_numeric(df.loc[idx, name], errors="coerce")
+            case_vals[name] = round(float(val), 4) if pd.notna(val) else None
+        per_case[valid[idx]["case_id"]] = case_vals
+    return {"summary": summary, "per_case": per_case, "n": len(valid)}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="问答系统评估")
+    parser.add_argument("--top-k", type=int, default=5, help="检索返回知识点数")
+    parser.add_argument("--limit", type=int, default=None, help="仅评估前 N 条")
+    parser.add_argument("--skip-ragas", action="store_true", help="跳过 ragas 指标")
+    parser.add_argument("--case-file", default=str(CASES_PATH), help="用例文件")
+    args = parser.parse_args()
+
+    cases = load_cases(Path(args.case_file))
+    if args.limit:
+        cases = cases[: args.limit]
+    print(f"[eval] 加载 {len(cases)} 条用例")
+
+    print("[eval] 加载知识库…")
+    kb = KnowledgeBase.load()
+
+    gen = None
+    if not args.skip_ragas:
+        if not DASHSCOPE_API_KEY:
+            print("[eval] 未设置 API_KEY，仅能评估 recall@k")
+        else:
+            gen = AnswerGenerator()
+
+    t0 = time.time()
+    rows, recalls = build_rows(cases, kb, gen, args.top_k)
+    print(f"[eval] 检索+生成完成，耗时 {time.time() - t0:.1f}s")
+
+    # ---- recall@k 汇总 ----
+    recall_summary: dict = {"per_case": recalls}
+    for k in ("recall@1", "recall@3", "recall@5", "recall@8"):
+        vals = [r[k] for r in recalls if r[k] is not None]
+        recall_summary[k] = {
+            "avg": round(sum(vals) / len(vals), 4) if vals else None,
+            "n": len(vals),
+        }
+    print("\n===== recall@k 汇总 =====")
+    for k, v in recall_summary.items():
+        if k.startswith("recall@"):
+            print(f"  {k}: avg={v['avg']} (n={v['n']})")
+
+    # ---- ragas 指标 ----
+    ragas_result = None
+    if not args.skip_ragas and gen is not None:
+        print("\n[eval] 运行 ragas 指标（调用 DashScope，可能需要几分钟）…")
+        llm = build_llm()
+        embeddings = build_embeddings()
+        ragas_result = run_ragas(rows, llm, embeddings)
+        print("\n===== ragas 指标汇总 =====")
+        for name, s in ragas_result.get("summary", {}).items():
+            print(f"  {name}: avg={s['avg']} (min={s['min']}, max={s['max']})")
+
+    # ---- 保存结果 ----
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "top_k": args.top_k,
+        "n_cases": len(cases),
+        "recall_summary": recall_summary,
+        "ragas": ragas_result,
+    }
+    out_path = RESULTS_DIR / f"evaluation_{datetime.now():%Y%m%d_%H%M%S}.json"
+    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[eval] 结果已保存: {out_path}")
+
+
+if __name__ == "__main__":
+    main()

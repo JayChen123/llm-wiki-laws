@@ -1,0 +1,29 @@
+/Users/chan/projects/llm_wiki_user_qa/.venv/bin/python /Users/chan/projects/llm_wiki_user_qa/eval/evaluate.py
+[eval] 加载 35 条用例
+[eval] 加载知识库…
+Loading weights: 100%|██████████| 391/391 [00:00<00:00, 62863.11it/s]
+Building prefix dict from the default dictionary ...
+Loading model from cache /var/folders/yx/_95bz00179jcztsdlyrf1jq00000gn/T/jieba.cache
+Loading model cost 0.267 seconds.
+Prefix dict has been built successfully.
+检索+生成: 100%|█████████████████████████████| 35/35 [05:07<00:00,  8.78s/条, eval_035 recall@1=0.0]
+[eval] 检索+生成完成，耗时 307.4s
+
+===== recall@k 汇总 =====
+  recall@1: avg=0.4024 (n=35)
+  recall@3: avg=0.7095 (n=35)
+  recall@5: avg=0.8333 (n=35)
+  recall@8: avg=0.931 (n=35)
+
+[eval] 运行 ragas 指标（调用 DashScope，可能需要几分钟）…
+  [ragas] 待计算指标（5 项，样本 35 条）：context_precision, context_recall, nv_context_relevance, answer_relevancy, faithfulness
+Evaluating: 100%|██████████| 175/175 [03:40<00:00,  1.26s/it]
+
+===== ragas 指标汇总 =====
+  context_precision: avg=0.8171 (min=0.0, max=1.0)
+  context_recall: avg=0.931 (min=0.25, max=1.0)
+  nv_context_relevance: avg=0.9857 (min=0.5, max=1.0)
+  answer_relevancy: avg=0.9124 (min=0.7309, max=0.998)
+  faithfulness: avg=0.9285 (min=0.5, max=1.0)
+
+[eval] 结果已保存: /Users/chan/projects/llm_wiki_user_qa/eval/results/evaluation_20260905_110754.json
