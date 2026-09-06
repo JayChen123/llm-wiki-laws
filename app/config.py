@@ -29,7 +29,7 @@ DASHSCOPE_API_KEY = os.getenv("API_KEY")
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # 检索参数
-TOP_K = 5  # 混合检索返回的知识点数量
-EXPAND_K = 3  # 沿关联边扩展的知识点数量（最终补充条数）
+TOP_K = 10  # 混合检索返回的知识点数量
+EXPAND_K = 5  # 沿关联边扩展的知识点数量（最终补充条数）
 EXPAND_HOPS = 3  # 图谱多跳扩展的最大跳数（BFS）
 EXPAND_DECAY = 0.5  # 多跳扩展的分数逐跳衰减系数

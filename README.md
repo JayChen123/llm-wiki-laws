@@ -88,7 +88,7 @@
 ## 三、项目结构
 
 ```
-llm_wiki_user_qa/
+llm_wiki_laws/
 ├── config.py                     # 配置单一来源（模型路径、LLM、数据库等，用户维护）
 ├── pyproject.toml                # 依赖与元数据（uv 管理）
 ├── data/
