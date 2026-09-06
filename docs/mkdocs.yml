@@ -1,5 +1,5 @@
-site_name: llm-wiki 劳动法问答系统
-site_description: 劳动法知识问答系统（非 RAG / llm-wiki）八讲授课课件
+site_name: llm-wiki 法律知识问答系统
+site_description: 法律知识问答系统（非 RAG / llm-wiki）八讲授课课件
 site_author: Vincent(陈杰)
 copyright: "法律知识问答系统 · 黑马研发"
 
@@ -15,8 +15,8 @@ theme:
   #  favicon: img/logo1.png
   language: zh
   font: false                      # 不引 Google Fonts，用系统字体（本地/离线友好）
-#  icon:
-#    logo: material/scale-balance
+  #  icon:
+  #    logo: material/scale-balance
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
@@ -34,7 +34,7 @@ theme:
         name: 切换到浅色
   features:
     - navigation.sections
-#    - navigation.expand
+    #    - navigation.expand
     - navigation.prune
     - navigation.top
     - content.code.copy
@@ -66,7 +66,7 @@ markdown_extensions:
 
 nav:
   - 课程首页:
-      - 首页: README.md
+      - 首页: 首页/index.md
   - 第一章 项目概述:
       - "第 1 讲 · RAG 的局限与 llm-wiki 理念": 第1章-项目概述/01-RAG的局限与llm-wiki理念.md
       - "第 2 讲 · 系统总览与工程环境": 第1章-项目概述/02-系统总览与工程环境.md
