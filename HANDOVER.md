@@ -53,7 +53,7 @@ uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/
 ## 3. 目录结构
 
 ```
-llm_wiki_user_qa/
+llm_wiki_laws/
 ├── config.py               # 配置单一来源（用户维护）：模型路径、LLM、DB 等
 ├── pyproject.toml          # 依赖（uv 管理）
 ├── uv.lock                 # 锁文件（提交）
