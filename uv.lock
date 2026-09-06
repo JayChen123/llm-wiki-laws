@@ -1132,7 +1132,7 @@ wheels = [
 ]
 
 [[package]]
-name = "llm-wiki-user-qa"
+name = "llm-wiki-laws"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

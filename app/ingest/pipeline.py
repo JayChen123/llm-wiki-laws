@@ -25,7 +25,7 @@ def discover_pdf_sources(src_dir: Path = SRC_DIR) -> list[Path]:
 
 
 def convert_pdf_to_md(
-    src_dir: Path = SRC_DIR, raw_dir: Path = RAW_DIR, verbose: bool = True
+        src_dir: Path = SRC_DIR, raw_dir: Path = RAW_DIR, verbose: bool = True
 ) -> list[Path]:
     """增量转换：仅转换 raw 目录中缺失对应 md 的 PDF，返回新增的 md 文件。"""
     raw_dir.mkdir(parents=True, exist_ok=True)

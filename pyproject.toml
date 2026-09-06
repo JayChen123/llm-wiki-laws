@@ -1,7 +1,7 @@
 [project]
 name = "llm-wiki-laws"
 version = "0.1.0"
-description = "Add your description here"
+description = "这是一个法律知识问答系统，主要提供劳动法等法律咨询"
 requires-python = ">=3.13"
 dependencies = [
     "jieba>=0.42.1",
