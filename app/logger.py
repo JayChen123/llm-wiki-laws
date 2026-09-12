@@ -35,12 +35,18 @@ def log_qa_event(
     answer: str,
     retrieval_ms: float | None = None,
     generation_ms: float | None = None,
+    intent: str | None = None,
+    reflect: dict | None = None,
     logger: logging.Logger | None = None,
 ) -> None:
     """记录一次问答的关键信息。
 
     knowledge_blocks 建议为 [{"id", "title", "score", "source"}, ...]，
     即本次检索命中的知识块（不含正文，避免日志冗长）。
+    intent 为意图识别结果（answerable/legal_uncovered/off_topic），
+    未启用或走兜底路径时用于区分"没检索"的原因。
+    reflect 为反思式多跳的轨迹（`{"rounds": n, "reasons": [...]}`），
+    用于事后审计"为什么停在第几轮"。
     """
     logger = logger or get_logger()
     event = {
@@ -52,4 +58,8 @@ def log_qa_event(
         "retrieval_ms": round(retrieval_ms, 1) if retrieval_ms is not None else None,
         "generation_ms": round(generation_ms, 1) if generation_ms is not None else None,
     }
+    if intent is not None:
+        event["intent"] = intent
+    if reflect is not None:
+        event["reflect"] = reflect
     logger.info(json.dumps(event, ensure_ascii=False))

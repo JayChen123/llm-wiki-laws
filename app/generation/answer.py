@@ -11,6 +11,7 @@ SYSTEM_PROMPT = (
     "（如\"依据《劳动合同法》第五十八条\"）。若问题需要综合多个知识点才能回答（多跳推理），"
     "请跨知识点组合、逻辑推理并说明依据，不要编造；单知识点可回答的按单点作答。"
     "若参考资料不足以回答，请如实说明不确定，不要臆造法条。"
+    "【用户背景】段落仅用于个性化（如称呼、关注点），**不得作为法律依据**，也不要列入引用。"
     "回答末尾另起一行列出引用的全部知识点标题（格式：引用：【标题1】【标题2】）。"
 )
 
@@ -32,11 +33,17 @@ class AnswerGenerator:
         query: str,
         contexts: list[dict],
         history: list[dict] | None = None,
+        memory: list[dict] | None = None,
     ):
-        """流式生成回答，逐块 yield 文本片段（供 CLI 打字机式输出）。"""
+        """流式生成回答，逐块 yield 文本片段（供 CLI 打字机式输出）。
+
+        `memory` 为长期记忆召回结果（用户画像/相关历史），只作为**个性化参考**注入，
+        与【参考资料】严格分区——记忆不是法律知识，不得当作法条依据。
+        """
         reference = self._format_contexts(contexts)
+        memory_block = self._format_memory(memory)
         user_prompt = (
-            f"【参考资料】\n{reference}\n\n【问题】\n{query}\n\n请回答："
+            f"{memory_block}【参考资料】\n{reference}\n\n【问题】\n{query}\n\n请回答："
         )
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history or [])
@@ -57,9 +64,23 @@ class AnswerGenerator:
         query: str,
         contexts: list[dict],
         history: list[dict] | None = None,
+        memory: list[dict] | None = None,
     ) -> str:
         """非流式生成回答（聚合 generate_stream 的完整结果）。"""
-        return "".join(self.generate_stream(query, contexts, history)).strip()
+        return "".join(self.generate_stream(query, contexts, history, memory)).strip()
+
+    @staticmethod
+    def _format_memory(memories: list[dict] | None) -> str:
+        """渲染长期记忆段落；空则返回空串（不产生多余标题）。"""
+        if not memories:
+            return ""
+        lines = ["【用户背景（仅供个性化参考，**不得作为法律依据**，也不得列入引用）】"]
+        for item in memories:
+            kind = "画像" if item.get("kind") == "profile" else "相关历史"
+            text = str(item.get("text", "")).strip().replace("\n", " ")
+            if text:
+                lines.append(f"- （{kind}）{text}")
+        return "\n".join(lines) + "\n\n" if len(lines) > 1 else ""
 
     @staticmethod
     def _format_contexts(contexts: list[dict]) -> str:

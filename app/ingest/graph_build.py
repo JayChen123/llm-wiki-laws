@@ -20,8 +20,10 @@ from app.retrieval.embedder import Embedder
 # 正文交叉引用：如"依照本法第三十九条……"（条文号用中文数字，含"千/零"，
 # 否则民法典"第一千一百六十五条"这类跨引用边建不出来）
 _ART_REF_RE = re.compile(rf"第[{CN_NUM_CHARS}]+条")
-# 交叉引用是直接的法条间链接，权重高于章节结构边，保证图谱扩展优先带到被引用条文
-_CROSSREF_WEIGHT = 1.5
+# 交叉引用是直接的法条间链接，权重高于章节结构边，保证图谱扩展优先带到被引用条文；
+# 反思式多跳（reflector）给取回的条文计名义分数时也复用它，故对外公开
+CROSSREF_WEIGHT = 1.5
+_CROSSREF_WEIGHT = CROSSREF_WEIGHT
 
 
 def _jaccard(a: list[str], b: list[str]) -> float:
@@ -38,6 +40,38 @@ def semantic_text(point: KnowledgePoint) -> str:
     需要编码时统一走此函数，避免两处各写一份模板。
     """
     return f"{point.title}\n{point.content[:200]}"
+
+
+def crossref_map(nodes: list[dict]) -> dict[str, list[str]]:
+    """条文正文里的"第X条"引用 → 本库同法条文 id 列表。
+
+    **图谱构建（建 crossref 边）与反思式多跳（挑候选被引条文）共用此函数**，
+    避免同一套引用解析规则写两遍而产生不一致（本项目已在中文数字字符集上踩过
+    一次"规则重复导致漏切"的坑）。
+
+    **仅同法内**：跨法引用不解析（与 crossref 边"跨法不建边"的策略一致）。
+    返回 `{node_id: [被引 node_id, ...]}`，按正文出现顺序去重，不含自引用。
+    """
+    by_law: dict[str, list[dict]] = {}
+    for node in nodes:
+        by_law.setdefault(node["source"].split(" L")[0], []).append(node)
+
+    result: dict[str, list[str]] = {}
+    for law_nodes in by_law.values():
+        ref_to_id: dict[str, str] = {}
+        for node in law_nodes:
+            m = re.search(rf"第[{CN_NUM_CHARS}]+条$", node["clause"])
+            if m:
+                ref_to_id.setdefault(m.group(0), node["id"])
+        for node in law_nodes:
+            targets: list[str] = []
+            for ref in _ART_REF_RE.findall(node["content"]):
+                target = ref_to_id.get(ref)
+                if target and target != node["id"] and target not in targets:
+                    targets.append(target)
+            if targets:
+                result[node["id"]] = targets
+    return result
 
 
 def build_graph(
@@ -109,20 +143,10 @@ def build_graph(
 
     # 4) 法条交叉引用：正文中"第X条"引用同法其他条文 → crossref 边。
     #    引用是直接的法条间链接（如 65 条引 39 条、46 条引 38 条），跨法不加边。
-    by_law: dict[str, list[KnowledgePoint]] = {}
-    for p in points:
-        by_law.setdefault(p.source.split(" L")[0], []).append(p)
-    for pts in by_law.values():
-        ref_to_id: dict[str, str] = {}
-        for p in pts:
-            m = re.search(rf"第[{CN_NUM_CHARS}]+条$", p.clause)
-            if m:
-                ref_to_id.setdefault(m.group(0), p.id)
-        for p in pts:
-            for ref in _ART_REF_RE.findall(p.content):
-                target = ref_to_id.get(ref)
-                if target and target != p.id:
-                    add_edge(p.id, target, "crossref", _CROSSREF_WEIGHT)
+    #    解析逻辑见 crossref_map()，与反思式多跳共用同一份实现。
+    for source_id, targets in crossref_map(nodes).items():
+        for target_id in targets:
+            add_edge(source_id, target_id, "crossref", _CROSSREF_WEIGHT)
 
     edge_list = [
         {

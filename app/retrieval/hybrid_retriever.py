@@ -77,8 +77,12 @@ class HybridRetriever:
                 frontier.append((nb, s))
         return expanded
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
-        """返回 [ {id,title,chapter,content,score,source} ]，已排序、含关联扩展。"""
+    def search(self, query: str, top_k: int = 5, expand: bool = True) -> list[dict]:
+        """返回 [ {id,title,chapter,content,score,source} ]，已排序。
+
+        `expand=False` 只返回 RRF 融合后的种子（供反思式多跳接管后续检索），
+        不再做固定深度 BFS 图谱扩展。
+        """
         kw = self.keyword_retriever.search(query, top_k=top_k * 3)
         vec = (
             self.vector_retriever.search(query, top_k=top_k * 3)
@@ -96,12 +100,16 @@ class HybridRetriever:
         base = {nid: rrf[nid] for nid in ranked_ids}
 
         # 图谱多跳扩展：从命中种子沿关联边 BFS 最多 N 跳，分数逐跳衰减
-        expanded_scores = self._bfs_expand(
-            ranked_ids, base, self.expand_hops, self.expand_k, self.expand_decay
-        )
-        extra_ids = sorted(expanded_scores, key=lambda k: -expanded_scores[k])[
-            : self.expand_k
-        ]
+        if expand:
+            expanded_scores = self._bfs_expand(
+                ranked_ids, base, self.expand_hops, self.expand_k, self.expand_decay
+            )
+            extra_ids = sorted(expanded_scores, key=lambda k: -expanded_scores[k])[
+                : self.expand_k
+            ]
+        else:
+            expanded_scores = {}
+            extra_ids = []
 
         ordered = ranked_ids + extra_ids
         results = []

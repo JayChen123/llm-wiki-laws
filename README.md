@@ -10,6 +10,7 @@
 
 ## 一、核心特性
 
+- **意图识别与兜底**：问答前先分类为「可答 / 法律相关但本库未覆盖 / 与法律无关」，后两类直接给兜底话术（说明本库覆盖范围 + 可问示例），**不检索也不生成**；分类器超时或异常时保守放行，不阻断正常问答。
 - **llm-wiki 知识编译**：摄入时把 PDF 编译为知识点 + 关联图谱，查询时只做"定位 + 综合"，知识与答案随时间复利积累。
 - **非 RAG 知识库**：不切块、不向量化存储；知识库是 `wiki/` 下的 Markdown 页面集 + `knowledge_graph.json`
   关联图谱，可直接用上下文窗口承载、可读可审计。
@@ -17,10 +18,11 @@
   劳动法 107 条 + 民法典 1260 条 = **1465 个**），可精确溯源到具体法条。
 - **混合检索**：BM25 关键词检索（索引含**概念关键词增强**，弥合法律措辞与用户口语鸿沟）与 bge-m3 向量检索（**存于 Milvus**）双路召回，*
   *RRF（Reciprocal Rank Fusion）** 融合排序，并沿关联边扩展相关知识点。
-- **多跳推理**：图谱四类边（结构/关键词/语义/法条交叉引用）+ BFS 多跳扩展，prompt 引导 LLM 跨知识点组合推理，支持"
-  试用期被解除有经济补偿吗"这类需综合多个法条的问题。
+- **多跳推理（反思式）**：图谱四类边（结构/关键词/语义/法条交叉引用）扩展出基础上下文后，由 **LLM 反思**自主决定是否继续沿**引用关系**深挖——判"已充分"就停、判"需要补"则只从**候选白名单**里挑被引条文（防幻觉）；无引用关系时**不调用 LLM 直接停止**。轮数上限 3，失败即停（fail-closed）。
+- **两条链路可切换**：`RETRIEVAL_MODE=reflect`（默认，= 图谱扩展 + 反思补取，上下文是 bfs 的超集）/ `bfs`（原固定深度扩展，保留用于 A/B 对比与回退）。
 - **概念导航**：`wiki/index.md` 提供"核心概念导航"，把"试用期/竞业限制/加班费/劳务派遣…"等法律概念链接到具体法条页。
-- **短期记忆（轻量）**：SQLite 单文件存储多轮会话；检索时注入最近用户问题（处理"那/具体/继续"等指代），生成时注入对话历史。
+- **双层记忆**：**短期**=会话消息（**MySQL** `messages`），按需注入检索词（只在"像追问"时才并入上一问，见下）与生成历史；**长期**=用户画像（MySQL `user_profile`）与历史问答语义索引（**Milvus** `llm_wiki_user_memory`），新问题先按 `user_id` 过滤召回该用户的相关记忆，作为"用户背景"注入生成（**不得作为法律依据**）。画像用 qwen-turbo **低频抽取**（默认每 5 轮），历史记忆用本地 bge-m3 编码（零 API 成本）。
+- **记忆只有 MySQL/Milvus 一套后端**：不做 SQLite 降级、不做连接失败回退——连不上就直接报错，避免数据分散或"以为在写 MySQL 其实在写本地文件"。
 - **引用溯源**：回答末尾标注引用的知识点标题（**含法律名**，避免多部法律同条号混淆），支持回溯原文（来源行号）。
 - **向量库（Milvus）**：知识点向量存于 Milvus（HNSW + COSINE），每次构建**全量对齐并清理陈旧主键**；Milvus 不可用时自动退化为纯关键词检索。
 - **流式输出**：CLI 采用 SSE 流式逐字渲染回答（打字机效果）。
@@ -30,9 +32,6 @@
 
 - 前端页面系统，支持多用户注册登录
 - 用户记忆模块优化，采用长期和短期记忆相结合的方式
-- 记忆存储sqlite --> mysql（`docker-compose.yml` 里 mysql:8.0.43 已就绪）
-- 多跳检索。需要智能体自主决定检索，尤其是检索到相互引用的情况，支持继续检索引用知识
-- 问答系统增加意图识别，与法律不想关的生成兜底回答
 - 系统改为异步过程，增加系统的并发能力
 - 系统压力测试
 - docker 部署
@@ -69,18 +68,22 @@
                                     ▼
 ┌──────────────────────────────  检索问答（Query）  ─────────────────────────────────┐
 │                                                                                      │
-│  用户问题 + 短期记忆注入（最近一问并入检索词）                                          │
-│        │                                                                             │
+│  用户问题 → 意图识别（可答 / 法律未覆盖 / 无关，后两类直接兜底返回）                      │
+│        │  + 短期记忆按需注入（像追问才并入上一问）                                       │
+│        ▼                                                                             │
 │        ├─► 关键词检索：jieba 分词 + BM25（含概念关键词）─┐                              │
-│        └─► 向量检索：bge-m3 编码 → Milvus 余弦检索 ─┼─► RRF 融合排序 ─► Top-K 知识点    │
+│        └─► 向量检索：bge-m3 编码 → Milvus 余弦检索 ─┼─► RRF 融合排序 ─► Top-K 种子     │
 │                                               │                                      │
-│                                                └─► 沿关联图多跳扩展（≤3跳）           │
+│        ┌──────────────────────────────────────┘                                      │
+│        ▼                                                                             │
+│  基础图谱扩展（≤3跳，四类边）→ 反思循环（≤3轮，LLM 决定是否沿引用继续深挖/是否已充分）    │
+│        ↓ 长期记忆召回（按 user_id 过滤：画像 + 相似历史）→ 作为"用户背景"注入生成          │
 │        │                                                                             │
 │        ▼                                                                             │
 │  qwen-max（DashScope OpenAI 兼容接口）综合生成                                         │
 │        │   + 短期记忆历史（最近 N 轮）+ 法律名上下文标题                                │
 │        ▼                                                                             │
-│  回答（带引用）→ 写入 SQLite 记忆（memory.db）                                         │
+│  回答（带引用）→ 写短期记忆（MySQL messages）+ 长期记忆（Milvus 历史语义索引）            │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -119,11 +122,16 @@ llm_wiki_laws/
 │   │   ├── vector_store.py       #    Milvus 向量库（建集合/全量对齐写入/余弦检索）
 │   │   ├── keyword_retriever.py  #    BM25 关键词检索
 │   │   ├── vector_retriever.py   #    bge-m3 编码 query → Milvus 检索 → 映射回知识点
-│   │   └── hybrid_retriever.py   #    RRF 融合 + 关联多跳扩展
+│   │   ├── hybrid_retriever.py   #    RRF 融合 + 基础图谱多跳扩展（expand=False 时只要种子）
+│   │   ├── reflector.py          #    检索反思器：判"是否已充分/该补哪几条引用条文"
+│   │   └── reflective_retriever.py #  反思式多跳：基础扩展 + 反思补取（默认链路）
 │   ├── generation/
 │   │   └── answer.py             # ③ qwen-max 综合生成（法律领域 prompt，带引用）
-│   └── memory/
-│       └── memory_store.py       # ④ SQLite 短期记忆
+│   └── memory/                   # ④ 双层记忆
+│       ├── mysql_store.py        #    短期记忆 + 画像（MySQL，唯一后端）
+│       ├── long_term.py          #    长期记忆向量库（Milvus，强制 user_id 过滤）
+│       ├── profile_extractor.py  #    画像低频抽取（qwen-turbo）
+│       └── __init__.py           #    create_memory_store() + 检索词注入策略
 ├── wiki/                         # 编译出的知识库（llm-wiki 页面集）
 │   ├── index.md
 │   ├── log.md
@@ -136,7 +144,8 @@ llm_wiki_laws/
 │   ├── metrics.py                #   recall@1/3/5/8 检索指标（自定义）
 │   ├── evaluate.py               #   评估主程序（recall@k + ragas）
 │   └── results/                  #   评估结果输出
-├── tests/                        # 单元测试（pytest，67 项）
+├── scripts/migrate_memory.py      # memory.db → MySQL 一次性迁移（默认不执行）
+├── tests/                        # 单元测试（pytest，140 项）
 └── README.md
 ```
 
@@ -176,6 +185,7 @@ llm_wiki_laws/
 
 ## 五、混合检索（Query）
 
+0. **意图识别**（`app/generation/intent.py`，可通过 `INTENT_ENABLED` 关闭）：判定为`legal_uncovered`（刑法/行政法/公司法等其他部门法）或`off_topic`（与法律无关）时，直接返回兜底话术，**不进检索与生成**，但照常写记忆与日志（日志带 `intent` 字段）；分类器超时（默认 3s）、异常或无 `API_KEY` 时保守放行。
 1. **记忆注入**：取出最近一条用户问题并入当前检索词，使"那/具体/继续"等指代延续有效。
 2. **双路召回**：
     - 关键词：jieba 分词 + `BM25Okapi`，索引含标题、正文与**概念增强后的关键词**（用户口语词可命中法律条文）；
@@ -191,7 +201,7 @@ llm_wiki_laws/
 
 ## 六、短期记忆（轻量）
 
-- **存储**：SQLite 单文件 `memory.db`，表结构极简（session/role/content/created_at），无外部依赖。
+- **存储**：MySQL 表 `users` / `sessions` / `messages`（utf8mb4），无本地文件依赖。
 - **注入检索**：`recent_user_queries()` 取最近 1 问并入检索词，解决指代与话题延续。
 - **注入生成**：`recent()` 取最近 10 条消息作为 LLM 对话历史，保证多轮连贯。
 - **会话管理**：CLI 可指定会话 ID，重开后可续聊上次对话；`/clear` 一键清空。
@@ -281,10 +291,22 @@ uv run python -m pytest tests/ -v
 | `MILVUS_HOST` / `MILVUS_PORT`  | `app/config.py`             | Milvus 地址（默认 `localhost:19532`，宿主机映射端口，容器内为 19530）                  |
 | `MILVUS_COLLECTION`            | `app/config.py`             | 向量集合名（默认 `llm_wiki_laws`）                                           |
 | `MILVUS_METRIC` / `MILVUS_INDEX` | `app/config.py`           | 度量（COSINE）/ 索引（HNSW）                                                 |
+| `INTENT_ENABLED`               | `app/config.py`             | 是否启用意图识别（默认开）                                                       |
+| `INTENT_MODEL`                 | `app/config.py`             | 意图分类用的轻量模型（默认 `qwen-turbo`）                                          |
+| `INTENT_TIMEOUT_S`             | `app/config.py`             | 分类超时秒数（默认 3），超时即保守放行                                                |
+| `RETRIEVAL_MODE`               | `app/config.py`             | 多跳链路：`reflect`（默认，反思式）/ `bfs`（原固定扩展，用于对比回退）                        |
+| `REFLECT_MODEL`                | `app/config.py`             | 反思用轻量模型（默认 `qwen-turbo`）                                             |
+| `REFLECT_MAX_ROUNDS`           | `app/config.py`             | 反思轮数上限（默认 3），防失控                                                   |
+| `REFLECT_TIMEOUT_S`            | `app/config.py`             | 反思超时秒数（默认 15），超时即停止继续检索                                             |
 | `EMBED_DIM`                    | `app/config.py`             | 向量维度（默认 1024，对应 bge-m3）                                             |
 | `TOP_K` / `EXPAND_K`           | `app/config.py`             | 检索返回知识点数（默认 10）/ 关联扩展数（默认 5）                                        |
 | `EXPAND_HOPS` / `EXPAND_DECAY` | `app/config.py`             | 图谱多跳扩展的最大跳数（默认 3）/ 分数逐跳衰减系数（默认 0.5）                                 |
-| `MEMORY_DB_PATH`               | `app/config.py`             | SQLite 记忆文件路径                                                       |
+| `MYSQL_HOST` / `MYSQL_PORT`    | `app/config.py`             | MySQL 地址（默认 `localhost:3308`，宿主机映射端口）                              |
+| `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | `app/config.py` | MySQL 账号与库（默认 root / 12345678 / `subjects_kg`）                    |
+| `MEMORY_COLLECTION`            | `app/config.py`             | 长期记忆向量集合（默认 `llm_wiki_user_memory`）                                   |
+| `MEMORY_RECALL_K`              | `app/config.py`             | 每次注入生成的记忆条数（默认 3）                                                   |
+| `MEMORY_INJECT_MODE`           | `app/config.py`             | 检索词注入策略：`auto`（默认，仅追问时并入上一问）/ `always` / `off`                        |
+| `PROFILE_EXTRACT_EVERY`        | `app/config.py`             | 每 N 轮抽一次画像（默认 5；0=关闭）                                              |
 | 关联阈值                           | `app/ingest/graph_build.py` | `keyword_threshold=0.3`、`semantic_threshold=0.75`、`crossref` 权重 1.5 |
 | 概念映射                           | `app/ingest/concept_map.py` | 法律概念→条文映射与用户查询词（可编辑扩充）                                              |
 
@@ -294,17 +316,22 @@ uv run python -m pytest tests/ -v
 
 ## 十、测试
 
-`tests/`（**67 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
+`tests/`（**140 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
 
 | 测试文件                        | 覆盖范围                                                              |
 |-----------------------------|-------------------------------------------------------------------|
+| `test_intent.py`            | 意图三分类、容错解析（围栏/噪音）、故障保守放行、兜底话术含覆盖范围与示例                              |
+| `test_cli_intent.py`        | CLI 意图路由：非可答路径跳过检索与生成、兜底仍写记忆与日志、混合序列只让可答题进检索                        |
 | `test_knowledge_extract.py` | 清洗、编/章/节/条解析、千位条号、编层级与同号章区分、分编边界、噪音过滤、`\f` 行号、康熙部首变体、表格回填、关键词 |
 | `test_concept_map.py`       | 概念映射文档感知匹配、关键词注入去重、民法典概念（含千位条号）                                   |
 | `test_graph_build.py`       | sibling/keyword/semantic/crossref 四类边、跨编同号章不建边、千位条号 crossref   |
 | `test_milvus_store.py`      | 集合 schema/索引、维度不符重建、全量对齐写入、陈旧主键清理、检索返回（假 client，离线）               |
 | `test_kb.py`                | Milvus 可用时启用向量检索、不可用时退化为纯关键词                                     |
 | `test_retrieval.py`         | BM25（含关键词字段）、向量检索、RRF 融合与图谱多跳扩展                                   |
-| `test_memory.py`            | SQLite 记忆读写、会话隔离、历史轮数限制                                           |
+| `test_reflector.py`         | 候选编号白名单（防幻觉）、容错解析、无候选不调 LLM、失败即停（mock LLM）                        |
+| `test_reflective_retriever.py` | 停止条件（无引用/已充分/要取的已收集）、迭代取回、轮数上限、不污染图谱节点                       |
+| `test_mysql_store.py`       | MySQL 记忆后端：**生成的 SQL 与绑定参数**（user_id 隔离、排序 LIMIT、画像去重、只吞唯一冲突）、串题注入策略 |
+| `test_long_term.py`         | 长期记忆：**用户隔离（安全关键）**、画像+历史召回、注入段落标注"不得作为法律依据"、后端故障直接暴露 |
 | `test_generation.py`        | 流式逐块输出、聚合、prompt 组装、上下文标题带法律名（mock LLM）                           |
 | `test_logger.py`            | 日志 JSON 事件字段完整性、缺失耗时兜底                                            |
 | `test_eval.py`              | recall@k 指标、评估数据行组装（mock 检索/生成）                                   |

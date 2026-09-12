@@ -43,8 +43,14 @@ def build_rows(
     kb: KnowledgeBase,
     gen: AnswerGenerator | None,
     top_k: int,
+    intent_classifier=None,
 ) -> tuple[list[dict], list[dict]]:
-    """对每条用例执行检索与生成，返回 (ragas 数据行, recall 明细)。"""
+    """对每条用例执行检索与生成，返回 (ragas 数据行, recall 明细)。
+
+    `intent_classifier` 传入时额外记录每条用例的意图分类结果，用于统计
+    **误判率**（用例全是法律题，被判为非 answerable 即为误判）。分类结果
+    只记录、不改变检索流程，recall 口径与历史基线保持可比。
+    """
     from tqdm import tqdm
 
     rows: list[dict] = []
@@ -52,6 +58,9 @@ def build_rows(
     pbar = tqdm(cases, desc="检索+生成", unit="条", ncols=100)
     for case in pbar:
         pbar.set_postfix_str(f"{case['id']} 检索…")
+        intent = None
+        if intent_classifier is not None:
+            intent = intent_classifier.classify(case["question"]).intent.value
         results = kb.search(case["question"], top_k=top_k)
         pbar.set_postfix_str(f"{case['id']} 命中{len(results)}块 生成…")
         contexts = [
@@ -84,7 +93,10 @@ def build_rows(
             "reference": case["answer"],
             "gen_ok": gen_ok,
         })
-        recalls.append({"id": case["id"], "type": case["type"], **recall})
+        detail = {"id": case["id"], "type": case["type"], **recall}
+        if intent is not None:
+            detail["intent"] = intent
+        recalls.append(detail)
     return rows, recalls
 
 
@@ -187,6 +199,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="仅评估前 N 条")
     parser.add_argument("--skip-ragas", action="store_true", help="跳过 ragas 指标")
     parser.add_argument("--case-file", default=str(CASES_PATH), help="用例文件")
+    parser.add_argument("--intent", action="store_true",
+                        help="额外跑意图分类并统计误判率（不改变 recall 口径）")
     args = parser.parse_args()
 
     cases = load_cases(Path(args.case_file))
@@ -204,9 +218,22 @@ def main() -> None:
         else:
             gen = AnswerGenerator()
 
+    intent_classifier = None
+    if args.intent:
+        from app.generation.intent import IntentClassifier
+        intent_classifier = IntentClassifier()
+        print("[eval] 已启用意图分类统计（用例全为法律题，非 answerable 即为误判）")
+
     t0 = time.time()
-    rows, recalls = build_rows(cases, kb, gen, args.top_k)
+    rows, recalls = build_rows(cases, kb, gen, args.top_k, intent_classifier)
     print(f"[eval] 检索+生成完成，耗时 {time.time() - t0:.1f}s")
+
+    if intent_classifier is not None:
+        from collections import Counter
+        dist = Counter(r["intent"] for r in recalls if r.get("intent"))
+        misrouted = [r["id"] for r in recalls if r.get("intent") not in (None, "answerable")]
+        print(f"[eval] 意图分布: {dict(dist)}")
+        print(f"[eval] 误判（法律题被判为不可答）{len(misrouted)} 条: {misrouted}")
 
     # ---- recall@k 汇总 ----
     recall_summary: dict = {"per_case": recalls}

@@ -1157,6 +1157,7 @@ dependencies = [
     { name = "markitdown", extra = ["pdf"] },
     { name = "openai" },
     { name = "pymilvus" },
+    { name = "pymysql" },
     { name = "rank-bm25" },
     { name = "sentence-transformers" },
 ]
@@ -1178,6 +1179,7 @@ requires-dist = [
     { name = "markitdown", extras = ["pdf"], specifier = ">=0.1.7" },
     { name = "openai", specifier = ">=2.53.0" },
     { name = "pymilvus", specifier = ">=2.5,<2.6" },
+    { name = "pymysql", specifier = ">=1.2.0" },
     { name = "rank-bm25", specifier = ">=0.2.2" },
     { name = "sentence-transformers", specifier = ">=5.7.0" },
 ]
@@ -2195,6 +2197,15 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/d3/13/899185f025802ba80255faa8e45b3f3bf9cb7bab2d4235e12e3322c8e2a4/pymilvus-2.5.18.tar.gz", hash = "sha256:9e517076068e98dac51c018bc0dfe1f651d936154e2e2d9ad6c7b3dab1164e2d" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/c0/9c/a2b50b2b369814003460ca12a3c195fbf11b89bc1a861c2aa737c33ad7f9/pymilvus-2.5.18-py3-none-any.whl", hash = "sha256:1b78badcfa8d62db7d0b29193fc0422e4676873ff1c745a9d75c2c885d7a7e32" },
+]
+
+[[package]]
+name = "pymysql"
+version = "1.2.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/c9/bc/1c6a92f385940f727daeecf3bacaf186e03875dff57197801046c583bcf0/pymysql-1.2.0.tar.gz", hash = "sha256:6c7b17ca686988104d7426c27895b455cdeea3e9d3ceb1270f0c3704fead8c33" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/c4/bd/2534e130295c8cfd4f0a2e31623baab7502278f1e97bcfe61db75656a77f/pymysql-1.2.0-py3-none-any.whl", hash = "sha256:62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0" },
 ]
 
 [[package]]

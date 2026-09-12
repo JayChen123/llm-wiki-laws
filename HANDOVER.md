@@ -7,7 +7,7 @@
 
 ## 0. 一句话速览
 
-基于 **llm-wiki** 理念构建的**法律知识问答系统**（**非 RAG**）：将《中华人民共和国劳动法》《中华人民共和国劳动合同法》《中华人民共和国民法典》提前"编译"为**结构化知识点 + 关联图谱**（1465 个知识点 / 21252 条边），查询时通过**关键词(BM25) + 向量(bge-m3，存于 Milvus) 混合检索**定位知识点，由大模型 **qwen-max** 综合生成回答，带**短期记忆**（SQLite）支持多轮对话，并提供 **Ragas 评估**体系。
+基于 **llm-wiki** 理念构建的**法律知识问答系统**（**非 RAG**）：将《中华人民共和国劳动法》《中华人民共和国劳动合同法》《中华人民共和国民法典》提前"编译"为**结构化知识点 + 关联图谱**（1465 个知识点 / 21252 条边），查询时通过**关键词(BM25) + 向量(bge-m3，存于 Milvus) 混合检索**定位知识点，由大模型 **qwen-max** 综合生成回答，带**双层记忆**（短期 MySQL + 长期画像/历史 Milvus）支持多轮对话，并提供 **Ragas 评估**体系。
 
 ---
 
@@ -44,7 +44,7 @@
 ```bash
 uv run python -m app.ingest.pipeline     # 构建知识库（全量重建，幂等）
 uv run python -m app.cli                 # 启动命令行问答
-uv run python -m pytest tests/ -v        # 运行全部测试（当前 67 项）
+uv run python -m pytest tests/ -v        # 运行全部测试（当前 140 项）
 uv run python -m eval.evaluate --limit 3 # 评估（试跑3条）
 uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/3/5/8）
 ```
@@ -90,24 +90,30 @@ llm_wiki_laws/
 │   │   ├── vector_store.py     # Milvus 向量库：建集合/全量对齐写入/余弦检索
 │   │   ├── keyword_retriever.py# BM25 关键词检索（索引含关键词字段）
 │   │   ├── vector_retriever.py # bge-m3 编码 query → Milvus 检索 → 映射回图谱节点
-│   │   └── hybrid_retriever.py # RRF 融合 + 图谱多跳扩展
+│   │   ├── hybrid_retriever.py # RRF 融合 + 基础图谱多跳扩展（expand=False 只回种子）
+│   │   ├── reflector.py        # 检索反思器：判"是否已充分 / 该补哪几条被引条文"
+│   │   └── reflective_retriever.py # 反思式多跳：基础扩展 + 反思补取（默认链路）
 │   ├── generation/         # ③ 回答生成
+│   │   ├── intent.py           # 意图识别（可答/法律未覆盖/无关）+ 兜底话术
 │   │   └── answer.py           # qwen-max 流式生成（法律领域 prompt）
-│   └── memory/             # ④ 短期记忆
-│       └── memory_store.py     # SQLite 存储
+│   └── memory/             # ④ 双层记忆
+│       ├── mysql_store.py      # 短期记忆 + 用户画像（MySQL，唯一后端）
+│       ├── long_term.py        # 长期记忆向量库（Milvus，强制 user_id 过滤）
+│       ├── profile_extractor.py# 画像低频抽取（qwen-turbo）
+│       └── __init__.py         # create_memory_store() + 检索词注入策略
 ├── wiki/                   # 编译出的知识库（llm-wiki 页面集，可重新生成）
 │   ├── index.md            #   知识索引（核心概念导航 + 按源文档分组；有"编"的法律按 编→章 两级）
 │   ├── log.md              #   构建日志
 │   └── concepts/KP_*.md    #   每个知识点一页（含双向链接）
 ├── knowledge_graph.json    # 知识点关联图谱（可重新生成，被 gitignore）
 ├── logs/qa.log             # 问答日志（被 gitignore）
-├── memory.db               # 短期记忆 SQLite（运行生成，被 gitignore）
+├── memory.db               # 旧 SQLite 记忆（仅迁移脚本的源文件，运行时不再使用）
 ├── eval/                   # 评估（Ragas 0.3）
 │   ├── qa_test_cases.jsonl #   35 条法律评估用例
 │   ├── metrics.py          #   recall@k 指标（自定义）
 │   ├── evaluate.py         #   评估主程序
 │   └── results/            #   结果输出（被 gitignore）
-└── tests/                  # 单元测试（pytest，67 项；全部离线，不连 Milvus/大模型）
+└── tests/                  # 单元测试（pytest，140 项；全部离线，不连 Milvus/大模型）
 ```
 
 ---
@@ -132,9 +138,12 @@ llm_wiki_laws/
 
 **`app/config.py`**：
 - `SRC_DIR` / `RAW_DIR`：`data/src` / `data/raw`
-- `WIKI_DIR` / `CONCEPTS_DIR` / `GRAPH_PATH` / `MEMORY_DB_PATH`
+- `WIKI_DIR` / `CONCEPTS_DIR` / `GRAPH_PATH`（`MEMORY_DB_PATH` 仅作迁移脚本源路径）
+- **记忆（MySQL/Milvus）**：`MYSQL_HOST`/`MYSQL_PORT`（默认 **3308**）/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE`、`MEMORY_COLLECTION`、`MEMORY_RECALL_K`、`MEMORY_SUMMARY_CHARS`、`PROFILE_EXTRACT_EVERY`、`PROFILE_MODEL`、`MEMORY_INJECT_MODE`
 - `BGE_MODEL_PATH`（**本地模型路径，机器相关，换环境先改这里**；指向 Itcast 目录仅是用户提供的配置值，**不作为实现参考**）/ `LLM_MODEL` / `DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL`
 - **Milvus**：`MILVUS_HOST` / `MILVUS_PORT`（默认 **19532**，是宿主机映射端口，容器内是 19530）/ `MILVUS_COLLECTION` / `MILVUS_METRIC=COSINE` / `MILVUS_INDEX=HNSW` / `EMBED_DIM=1024`，均可用环境变量覆盖
+- **意图识别**：`INTENT_ENABLED`（默认开）/ `INTENT_MODEL`（默认 `qwen-turbo`）/ `INTENT_TIMEOUT_S`（默认 3，超时保守放行）
+- **多跳链路**：`RETRIEVAL_MODE`（`reflect` 默认 / `bfs` 对照）/ `REFLECT_MODEL`（默认 `qwen-turbo`）/ `REFLECT_MAX_ROUNDS`（默认 3，防失控）/ `REFLECT_TIMEOUT_S`（默认 15，超时即停）
 - 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（生成上下文最多 15 块）
 
 ### 5.2 知识构建管线（`app/ingest/`）
@@ -204,18 +213,43 @@ llm_wiki_laws/
 - `search(query, top_k)` 返回 **top_k 种子 + 至多 expand_k 扩展**（默认 10 + 5，最多 15 块，生成器全用）
 - **已知局限**：宽泛"措施/责任"类问题（如同时涉及多法多条文）扩展易被稀释，部分期望条文会落入扩展区甚至丢失（详见 §6 评估结果）。
 
-### 5.4 生成（`app/generation/answer.py`）
+### 5.4 生成（`app/generation/`）
+
+**`intent.py`**（问答前路由）：
+- 三分类 `Intent`：`ANSWERABLE`（可答）/ `LEGAL_UNCOVERED`（法律相关但本库未覆盖，如刑法/行政法/公司法）/ `OFF_TOPIC`（与法律无关）
+- `IntentClassifier.classify(query)`：调 `INTENT_MODEL`（默认 `qwen-turbo`，`temperature=0`），要求只输出 JSON；`parse_intent()` 容错解析（容忍 markdown 围栏与前后噪音）
+- **保守放行**：超时/异常/无 key/解析不出 → 一律 `ANSWERABLE`，reason 里带上原因便于排查。宁可多答一次，也不要把正常法律问题挡掉
+- `fallback_answer(intent)`：两套兜底话术（未覆盖 → 说明覆盖范围 + 建议改写；无关 → 礼貌拒绝 + 可问示例）
+- `COVERED_LAWS`：本库覆盖的法律（提示词与话术共用，**新增知识源时同步这里**）
+- 接入点：`cli.py` 在检索前调用，非 `ANSWERABLE` 直接兜底并 `continue`（跳过检索与生成，但**照常写记忆与日志**，否则多轮上下文会断）；`logger` 增加可选 `intent` 字段；`eval --intent` 只统计误判率、不改变 recall 口径
+
+**`answer.py`**：
 
 - `AnswerGenerator`：OpenAI 客户端指向 DashScope 兼容接口
 - `generate_stream()`：**流式**生成（`stream=True`，逐块 yield），`generate()` 聚合完整结果
 - **SYSTEM_PROMPT 为民事法律领域定制**："依据《中华人民共和国民法典》《中华人民共和国劳动法》《中华人民共和国劳动合同法》…解答劳动权益、劳动合同…以及合同、物权、侵权责任、婚姻家庭、继承等民事法律问题…涉及具体规定时点明法律依据…不要臆造法条…末尾列出全部引用"
 - `_format_contexts()`：每条 context 截断 600 字；**标题带法律名**（从 `source` 提取，如 `中华人民共和国劳动合同法·第四章·第八十五条`）——多部法律同章同条号，不带法律名会导致 LLM 张冠李戴。民法典的标题还会自带编名（`中华人民共和国民法典·第七编 侵权责任·第十章·第一千二百五十四条`）
 
-### 5.5 短期记忆（`app/memory/memory_store.py`）
+### 5.5 双层记忆（`app/memory/`）
 
-- SQLite 单文件 `memory.db`，表 `messages(session, role, content, created_at)`
-- `add`/`recent`/`recent_user_queries`/`clear`
-- 轻量注入：检索时把最近 1 条用户问题并入检索词（处理"那/继续"等指代）；生成时注入最近 10 条历史
+**短期（`mysql_store.MySQLMemoryStore`，MySQL 唯一后端）**
+- 表：`users` / `sessions` / `messages(session_id, user_id, role, content)` / `user_profile`（utf8mb4）
+- 接口：`add`/`recent`/`recent_user_queries`/`turn_count`/`clear`/`clear_user`/`add_fact`/`facts`/`ensure_user`/`ensure_session`
+- **不做 SQLite 降级、不做连接失败回退**：连不上直接报错（避免数据分散、"以为在写 MySQL 实际写本地文件"）
+
+**长期（`long_term.LongTermMemory`）**
+- 画像（结构化事实）→ MySQL `user_profile`，`UNIQUE(user_id, fact)` 去重
+- 历史问答（语义索引）→ Milvus 集合 `llm_wiki_user_memory`（与法律知识 `llm_wiki_laws` 分离）
+- **红线一：检索必须带 `filter=user_id == "..."`**，否则跨用户泄漏
+- **红线二：记忆只注入生成的"用户背景"段落**并标注"不得作为法律依据"，**绝不并入检索词**
+  （否则重演"上一问污染法条检索"）
+- 向量用本地 bge-m3 编码（零 API 成本）；历史摘要直接取"问题+答案"，不额外调 LLM
+
+**画像抽取（`profile_extractor.ProfileExtractor`）**：`PROFILE_EXTRACT_EVERY`（默认每 5 轮）用
+qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**排除敏感信息**；失败返回空列表。
+
+**检索词注入（`memory.build_search_query`）**：`MEMORY_INJECT_MODE=auto`（默认）只在问题"像追问"
+（含指代词，或很短且无法律实体词）时才并入上一问，修掉换话题时的串题污染。
 
 ### 5.6 知识库加载（`app/kb.py`）
 
@@ -264,7 +298,7 @@ llm_wiki_laws/
 
 ---
 
-## 7. 测试（`tests/`，67 项全过）
+## 7. 测试（`tests/`，140 项全过）
 
 | 文件 | 覆盖 |
 |---|---|
@@ -274,7 +308,12 @@ llm_wiki_laws/
 | `test_milvus_store.py` | 集合 schema/索引、维度不符重建、全量对齐写入、**陈旧主键清理（含可见性延迟下的顺序回归）**、`(kp_id, score)` 返回、条数统计（假 client，离线） |
 | `test_kb.py` | Milvus 可用时启用向量检索、**不可用时退化为纯关键词且不抛异常** |
 | `test_retrieval.py` | BM25（含关键词字段）、向量（假 store）、RRF 融合、图谱多跳扩展 |
-| `test_memory.py` | SQLite 记忆读写、会话隔离、轮数限制 |
+| `test_reflector.py` | 候选编号白名单（防幻觉）、容错解析、无候选不调 LLM、失败即停 |
+| `test_reflective_retriever.py` | 四个停止条件、迭代取回、轮数上限、不污染图谱节点 |
+| `test_mysql_store.py` | MySQL 记忆后端：生成的 SQL 与绑定参数（user_id 隔离、排序 LIMIT、画像去重）、串题注入策略 |
+| `test_long_term.py` | 长期记忆：用户隔离、画像+历史召回、注入段落标注、后端故障直接暴露 |
+| `test_intent.py` | 意图三分类、容错解析、故障保守放行、兜底话术（mock LLM） |
+| `test_cli_intent.py` | CLI 意图路由：非可答跳过检索与生成、兜底仍写记忆与日志、混合序列只让可答题进检索 |
 | `test_generation.py` | 流式逐块、聚合、prompt 组装与多跳引导、**上下文标题带法律名**（mock LLM） |
 | `test_logger.py` | 日志 JSON 事件、缺失耗时兜底 |
 | `test_eval.py` | recall@k 指标、评估数据行组装（mock 检索/生成） |
@@ -300,12 +339,16 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 
 **问答**（`uv run python -m app.cli`）：
 ```
-用户query + 短期记忆注入
+用户query → 意图识别（可答 / 法律未覆盖 / 无关）
+  └─► 非"可答"：兜底话术（不检索不生成）→ 写记忆 + 写日志（带 intent）→ 继续
+  └─► "可答"：短期记忆注入
   └─► BM25 关键词（含概念关键词）+ bge-m3 向量（Milvus）双路召回
   └─► RRF 融合 → Top-K 种子（默认 10）
   └─► 图谱多跳扩展（≤3跳，衰减0.5，crossref 权重1.5，至多 5 个）
+  └─► 反思循环（reflect 模式）：候选=已收集条文的被引条文；无候选不调 LLM 直接停；
+      否则 LLM 判 sufficient/fetch（白名单编号），至多 REFLECT_MAX_ROUNDS 轮
   └─► qwen-max 流式生成（民事法律 prompt + 法律名标题 + 引用）
-  └─► 写日志 logs/qa.log + 写记忆 memory.db
+  └─► 写日志 logs/qa.log + 短期记忆（MySQL messages）+ 长期记忆（Milvus 历史语义索引）
 ```
 
 ---
@@ -327,7 +370,14 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 14. **bge-m3 模型较大**（2.2GB），首次加载慢；`graph_build` 编码一次后向量复用（语义边 + Milvus 写入库），不要再重复编码。
 15. **知识库规模**：1465 知识点 / 21252 边（sibling 15306 / semantic 11720 / keyword 3446 / crossref 97）；语义阈值 0.75（0.65 会近全连接），keyword 0.3，crossref 权重 1.5。
 16. `.gitignore` 忽略：`data/`、`knowledge_graph.json`、`logs/`、`memory.db`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。⚠️ **`wiki/` 已不再被忽略**，`wiki/concepts/` 下的页面与其 `.obsidian/`（Obsidian 本地配置）都会被提交，改动时注意别把编辑器状态一起带进去。
-17. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
+17. **意图识别别"两头堵"**：分类器**只做路由**，不参与知识定位；且任何故障都要**保守放行**（归 `ANSWERABLE`）。反过来若把分类做得过于激进，正常法律问题会被误判成"未覆盖"而白白拒答——改动分类提示词或换模型后，跑 `uv run python -m eval.evaluate --skip-ragas --intent` 看误判率（用例全是法律题，非 `answerable` 即为误判）。
+18. **反思式检索别做成"纯反思"**：曾实现过一版"反思完全替代图谱扩展、候选只有引用关系"，recall@8 从 **0.9262 掉到 0.8548** —— 掉的全是 sibling/semantic 邻居带来的补充（它们不属于"引用关系"）。现方案是 **reflect = 基础扩展 + 反思补取**（超集），recall 与 bfs 完全一致（0.431/0.7119/0.8405/0.9262）。改这块务必先跑 `RETRIEVAL_MODE=reflect` 与 `bfs` 两遍 `eval --skip-ragas` 对比。
+19. **反思的增量天然有限**：全库只有 **68/1465** 个知识点正文里有可跟进的同法引用（97 处），且这些被引条文大多已被基础扩展（crossref 权重 1.5）带进上下文。实测 35 条用例中：19 条因"无引用关系"零额外调用、约 20 条各多 1 次 qwen-turbo、**只有 2 条真正补到条文（+4 个知识点）**。若想让反思承担更多，可考虑调低 BFS 的 crossref 权重把引用链让给反思（未验证）。
+20. **跨话题串题（已在 P3 修复）**：`cli.py` 曾无条件把上一问并入检索词（`" ".join(past + [q])`）以处理"那/具体"指代，用户**换话题**时会污染检索词、并让反思顺着错话题补取条文（实测 P2：会话里先问"劳务派遣…"再问"试用期最长多久"，命中混入 KP_065/058/059）。现由 `memory.build_search_query(mode="auto")` 只在"像追问"（含指代词，或很短且无法律实体词）时才并入；修复后同一场景 Q2 的 13 块全是试用期条文，无劳务派遣残留。
+21. **记忆不做降级是有意为之**：曾实现过 SQLite 降级后端，但它在 `facts()` 里漏了 `user_id` 过滤，导致**画像跨用户泄漏**（单测 `test_alice/bob` 抓到）——降级路径同样要守隔离红线，且多用户场景（P4）下 MySQL 一挂就会踩到。现已**彻底删除 SQLite 记忆实现**：MySQL 是唯一后端，连不上直接报错，避免数据分散、也避免"以为在写 MySQL 实际写本地文件"。`MEMORY_DB_PATH` 仅保留给迁移脚本当源路径。
+22. **Milvus 的 flush 坑在记忆库上又踩了一次**：`UserMemoryStore.clear()` 一开始漏了 `flush()`，真实 Milvus 上"清除我的数据"看似成功、其实延迟生效（当时 `count()` 仍读到旧值）。**写入与删除都要 flush**（见第 9 条）；假 client 必须忠实模拟"未 flush 查不到"，否则这类顺序问题在单测里蒙混过关。
+23. **长期记忆只注入生成、绝不并入检索词**：记忆是"用户背景"，不是法律知识。并入检索会重演串题污染，且可能让 LLM 把用户历史当成法条依据。注入段落显式标注"不得作为法律依据、不得列入引用"，`test_long_term.py` 有专测卡住这一点。
+24. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
 
 ---
 
@@ -338,7 +388,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 - **实体链接 + 图传播**：从 query 抽实体 → 图谱节点 → 影响力传播召回。
 - **评估完善**：可增加"测试集抽样"、`--limit` 随机采样、结果对比历史版本。
 - **新增法律**：把新法律 PDF 放入 `data/src/` → 重跑 pipeline；如需其在概念导航出现，需在 `concept_map.py` 补映射。若新法律也有"编/分编"层级或千位条号，先确认 `CN_NUM_CHARS`/`_PART_RE`/`_SUBPART_RE` 覆盖得住。
-- **MySQL 记忆迁移**：`docker-compose.yml` 里已有 mysql:8.0.43（宿主机 3308），短期记忆仍在 SQLite。
+- **旧记忆迁移**：`scripts/migrate_memory.py` 可把旧 `memory.db` 的会话迁入 MySQL（默认只预演，加 `--apply` 才写）。
 - **多用户/并发/异步**、**意图识别与兜底回答**、**图数据库存图谱**：见 README「后续优化功能」。
 
 ---
@@ -346,7 +396,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 ## 11. 验收/继续开发检查清单
 
 - [ ] Milvus 在跑：`docker ps` 见 `milvus-standalone`（宿主机端口 **19532**）
-- [ ] `uv run python -m pytest tests/ -v` → **67 passed**
+- [ ] `uv run python -m pytest tests/ -v` → **140 passed**
 - [ ] `uv run python -m app.ingest.pipeline` → **1465 知识点 / 21252 关联边** + `向量已写入 Milvus 集合 llm_wiki_laws：1465 条`
 - [ ] Milvus 条数核对：`MilvusVectorStore().count()` → 1465
 - [ ] `export API_KEY=... && uv run python -m app.cli` → 多轮问答正常（含民法典问题，如"高空抛物致人损害谁担责"应命中第一千二百五十四条）
