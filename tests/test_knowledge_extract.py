@@ -1,7 +1,7 @@
-"""知识点提取（法律法规）：章/节/条解析、清洗、康熙部首归一、关键词。"""
+"""知识点提取（法律法规）：编/章/节/条解析、清洗、康熙部首归一、关键词。"""
 from pathlib import Path
 
-from app.ingest.knowledge_extract import extract_knowledge_points
+from app.ingest.knowledge_extract import cn_to_int, extract_knowledge_points
 
 # 法律文档样例：页眉日期、页眉文件名、页码、URL、页脚噪音、康熙部首变体（第⼀条）、
 # 正文折行处的交叉引用（第三十九条和第四十条…，条后无空白）
@@ -84,6 +84,87 @@ def test_keywords_extracted(tmp_path: Path):
     assert all(len(k) > 1 for k in points[0].keywords)
 
 
+# 民法典风格样例：编→分编→章→条，含千位条号、裸域名 / 斜杠日期页眉、章前言
+CIVIL_SAMPLE = (
+    "中华人民共和国民法典_中国人大网\n"
+    "\n"
+    "第一编  总    则\n"
+    "\n"
+    "第一章  基本规定\n"
+    "\n"
+    "www.npc.gov.cn/npc/c30834/202006/75ba6483b8344591abd07917e1d25cc8.shtml\n"
+    "\n"
+    "第一条　为了保护民事主体的合法权益，制定本法。\n"
+    "\n"
+    "第二编  物    权\n"
+    "\n"
+    "第一分编  通    则\n"
+    "\n"
+    "第一章  物权通则\n"
+    "\n"
+    "本章规定物权的设立、变更、转让和消灭。\n"
+    "\n"
+    "8/23/2020\n"
+    "\n"
+    "第一千条　因物的归属和利用产生的民事关系，适用本编规定。\n"
+)
+
+
+def test_cn_to_int_supports_thousand():
+    """中文数字含"千"：民法典"第一千二百六十条"等千位条号依赖它。"""
+    assert cn_to_int("九十八") == 98
+    assert cn_to_int("一百零三") == 103
+    assert cn_to_int("九百九十九") == 999
+    assert cn_to_int("一千") == 1000
+    assert cn_to_int("一千零一") == 1001
+    assert cn_to_int("一千二百六十") == 1260
+
+
+def test_part_and_thousand_articles(tmp_path: Path):
+    """编层级 + 千位条号：旧实现数字类缺"千"，民法典第1000条起整段漏切。"""
+    points = _extract(tmp_path, CIVIL_SAMPLE)
+    assert len(points) == 2                    # 章前言与页眉噪音不单独成点
+    p0, p1 = points
+    assert (p0.part, p0.part_title) == ("第一编", "总则")
+    assert p0.title == "第一编 总则·第一章·第一条"
+    assert p0.clause == "第一条"
+    assert (p1.part, p1.part_title) == ("第二编", "物权")
+    assert p1.clause == "第一千条"
+    assert p1.title == "第二编 物权·第一章·第一千条"
+
+
+def test_part_disambiguates_repeated_chapter_no(tmp_path: Path):
+    """民法典各编章号重新起算：同号章须靠 part 区分，不能合并。"""
+    points = _extract(tmp_path, CIVIL_SAMPLE)
+    assert [(p.part, p.chapter) for p in points] == [("第一编", "第一章"), ("第二编", "第一章")]
+
+
+def test_subpart_heading_is_boundary_not_content(tmp_path: Path):
+    """"第二分编 典型合同"这类分编标题既不产生知识点，也不并入上一条文正文。"""
+    points = _extract(tmp_path, CIVIL_SAMPLE)
+    blob = "".join(p.content for p in points)
+    assert "分编" not in blob and "通则" not in blob
+    assert "本章规定物权的设立" not in blob     # 章前言同样不挂到任何条文
+
+
+def test_noise_filters_bare_domain_and_slash_date(tmp_path: Path):
+    """页眉噪音：裸域名（无 http:// 前缀）与"月/日/年"日期。"""
+    points = _extract(tmp_path, CIVIL_SAMPLE)
+    blob = "".join(p.content + p.title for p in points)
+    assert "www.npc.gov.cn" not in blob
+    assert "8/23/2020" not in blob
+
+
+def test_form_feed_keeps_physical_line_numbers(tmp_path: Path):
+    """换页符 \\f 不得让 source 行号偏离编辑器实际行号（splitlines 会多算行）。"""
+    text = "第一章 总则\n第一条 内容甲。\f2/8\n第二条 内容乙。\n"
+    points = _extract(tmp_path, text)
+    assert len(points) == 2
+    assert points[0].source.endswith("L2-3")   # 第一条 在物理第 2 行
+    assert points[1].source.endswith("L3-4")   # 第二条 在物理第 3 行（\f 未多算一行）
+    assert "2/8" not in "".join(p.content for p in points)
+
+
 def test_real_markdown_extracts(tmp_path: Path):
     from app.config import RAW_DIR
 
@@ -108,3 +189,13 @@ def test_real_markdown_extracts(tmp_path: Path):
         assert any(p.clause == "第一百零七条" for p in points)
         blob = "".join(p.content + p.title for p in points)
         assert not [c for c in blob if 0x2E80 <= ord(c) <= 0x2FFF]
+
+    mfd = [s for s in sources if "民法典" in s.name]
+    if mfd:
+        # 民法典 7 编 1260 条：千位条号修复前只能抽到 999 条
+        points = extract_knowledge_points(mfd[0])
+        assert len(points) == 1260
+        assert {p.part for p in points} == {f"第{n}编" for n in "一二三四五六七"}
+        assert any(p.clause == "第一千二百六十条" for p in points)
+        assert all(p.clause for p in points)             # 无章标题之类的空条文知识点
+        assert not [p for p in points if "分编" in p.content]

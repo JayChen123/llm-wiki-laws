@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.config import GRAPH_PATH, RAW_DIR, SRC_DIR, VECTOR_CACHE_PATH
+from app.config import GRAPH_PATH, RAW_DIR, SRC_DIR
 from app.ingest.concept_map import enrich_keywords
-from app.ingest.graph_build import build_graph, save_graph
+from app.ingest.graph_build import build_graph, save_graph, semantic_text
 from app.ingest.knowledge_extract import KnowledgePoint, extract_knowledge_points
 from app.ingest.pdf_to_markdown import pdf_to_markdown
 from app.ingest.wiki_writer import write_wiki
 from app.retrieval.embedder import Embedder
+from app.retrieval.vector_store import MilvusVectorStore
 
 
 def discover_pdf_sources(src_dir: Path = SRC_DIR) -> list[Path]:
@@ -70,14 +71,28 @@ def run_pipeline(use_semantic: bool = True, verbose: bool = True) -> dict:
         print(f"[pipeline] 知识点总数 {len(points)}")
 
     embedder = None
+    vectors = None
     if use_semantic:
         if verbose:
             print("[pipeline] 加载 bge-m3 编码语义向量…")
         embedder = Embedder()
-        embedder.cache([f"{p.title}\n{p.content[:200]}" for p in points], VECTOR_CACHE_PATH)
+        # 只编码一次，结果同时供语义边构建与向量库写入（早期实现编码了两遍）
+        vectors = embedder.encode([semantic_text(p) for p in points])
 
-    graph = build_graph(points, embedder=embedder)
+    graph = build_graph(points, embedder=embedder, vectors=vectors)
     save_graph(graph, GRAPH_PATH)
+
+    if vectors is not None:
+        try:
+            store = MilvusVectorStore()
+            store.ensure_collection()
+            written = store.upsert(graph["nodes"], vectors)
+            if verbose:
+                print(f"[pipeline] 向量已写入 Milvus 集合 {store.collection}：{written} 条")
+        except Exception as exc:   # 图谱与 Wiki 已落盘，不因向量库故障丢弃本次构建
+            print(f"[pipeline] 警告：向量写入 Milvus 失败（{exc}）——"
+                  f"图谱与 Wiki 已生成，但向量检索将不可用或是旧数据")
+
     write_wiki(points, graph)
     if verbose:
         n_edges = len(graph["edges"])

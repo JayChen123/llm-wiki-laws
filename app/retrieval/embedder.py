@@ -1,4 +1,9 @@
-"""bge-m3 向量编码器，带本地缓存。"""
+"""bge-m3 向量编码器。
+
+向量不再落 `.npy` 文件缓存（只按文件存在与否判断命中，重建知识库后易出现
+与实际节点集不一致却静默生效的旧向量）；现由 `app/retrieval/vector_store.py`
+写入 Milvus。
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,16 +35,6 @@ class Embedder:
         )
         self.dim = vecs.shape[1]
         return np.asarray(vecs, dtype=np.float32)
-
-    def cache(self, texts: list[str], cache_path: Path) -> np.ndarray:
-        """编码并缓存到 numpy 文件；缓存命中则直接加载。"""
-        if cache_path.exists():
-            return np.load(cache_path)
-        vecs = self.encode(texts)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(cache_path, vecs)
-        return vecs
-
 
 # class DummyEmbedder:
 #     """测试用假编码器：按文本哈希映射到固定向量，避免加载大模型。"""

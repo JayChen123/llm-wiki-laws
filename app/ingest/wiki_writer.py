@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import datetime
+import re
 
 from app.config import CONCEPTS_DIR, WIKI_DIR
 from app.ingest.concept_map import CONCEPT_MAP
-from app.ingest.knowledge_extract import KnowledgePoint
+from app.ingest.knowledge_extract import KnowledgePoint, cn_to_int
 
 
 def write_wiki(points: list[KnowledgePoint], graph: dict) -> None:
@@ -20,16 +21,13 @@ def write_wiki(points: list[KnowledgePoint], graph: dict) -> None:
     )
 
 
-_CN_NUMS = "零一二三四五六七八九十"
+def _order_no(label: str) -> int:
+    """把"第二编"/"第二十九章"排成整数用于目录排序；空标签（无"编"的法律）排最前。
 
-
-def _chapter_no(chapter: str) -> int:
-    s = chapter.replace("第", "").replace("章", "")
-    if s in _CN_NUMS:
-        return _CN_NUMS.index(s)
-    if len(s) == 2 and s[0] == "十":          # 十一、十二…
-        return 10 + _CN_NUMS.index(s[1])
-    return 99
+    旧实现只认"一"~"九十九"的两位数写法，民法典的"第二十九章"会落到兜底值导致章节乱序。
+    """
+    s = re.sub(r"[第编章节]", "", label)
+    return cn_to_int(s) if s else -1
 
 
 def _resolve_concept(law: str, article: str, points: list[KnowledgePoint]):
@@ -42,7 +40,8 @@ def _resolve_concept(law: str, article: str, points: list[KnowledgePoint]):
 
 def _concept_index_section(points: list[KnowledgePoint]) -> str:
     lines = ["## 核心概念导航", "",
-             "> 概念 → 相关条文知识点，可快速定位具体条款（跨《劳动合同法》《劳动法》）。", ""]
+             "> 概念 → 相关条文知识点，可快速定位具体条款"
+             "（跨《劳动合同法》《劳动法》《民法典》）。", ""]
     for concept, refs in CONCEPT_MAP.items():
         links = []
         for law, article in refs:
@@ -63,14 +62,19 @@ def _index_md(points: list[KnowledgePoint], graph: dict) -> str:
         by_doc.setdefault(doc, []).append(p)
     for doc in sorted(by_doc):
         lines.append(f"## {doc}")
-        by_chapter: dict[str, list[KnowledgePoint]] = {}
+        # 有"编"的法律（民法典）按 编→章 两级分组；无编的（劳动法/劳动合同法）直接按章，
+        # 否则民法典各编同号章会被并成一个目录节
+        by_part: dict[tuple[str, str], dict[str, list[KnowledgePoint]]] = {}
         for p in by_doc[doc]:
-            by_chapter.setdefault(p.chapter, []).append(p)
-        for chapter in sorted(by_chapter, key=_chapter_no):
-            lines.append(f"### {chapter}")
-            for p in by_chapter[chapter]:
-                lines.append(f"- [[{p.id}|{p.title}]]")
-            lines.append("")
+            by_part.setdefault((p.part, p.part_title), {}).setdefault(p.chapter, []).append(p)
+        for part, part_title in sorted(by_part, key=lambda k: _order_no(k[0])):
+            if part:
+                lines.append(f"### {part} {part_title}".rstrip())
+            for chapter in sorted(by_part[(part, part_title)], key=_order_no):
+                lines.append(f"{'####' if part else '###'} {chapter}")
+                for p in by_part[(part, part_title)][chapter]:
+                    lines.append(f"- [[{p.id}|{p.title}]]")
+                lines.append("")
     lines.append(f"共 {len(points)} 个知识点，{len(graph['edges'])} 条关联关系。\n")
     return "\n".join(lines)
 
@@ -83,6 +87,7 @@ def _concept_md(p: KnowledgePoint, graph: dict) -> str:
         "---",
         f"id: {p.id}",
         f"title: {p.title}",
+        *([f"part: {p.part} {p.part_title}".rstrip()] if p.part else []),
         f"chapter: {p.chapter}",
         f"source: {p.source}",
         f"keywords: {', '.join(p.keywords)}",

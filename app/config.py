@@ -19,13 +19,21 @@ RAW_DIR = DATA_DIR / "raw"  # markdown 原始文件（PDF 转换产物 + 用户�
 WIKI_DIR = BASE_DIR / "wiki"
 CONCEPTS_DIR = WIKI_DIR / "concepts"
 GRAPH_PATH = BASE_DIR / "knowledge_graph.json"
-VECTOR_CACHE_PATH = BASE_DIR / "wiki" / "knowledge_vectors.npy"
 MEMORY_DB_PATH = BASE_DIR / "memory.db"
+
+# Milvus 向量库：知识点向量的存储与检索（服务端见 docker/docker-compose.yml）
+# 端口是宿主机映射端口（容器内为 19530），换环境改环境变量即可
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19532")
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "llm_wiki_laws")
+MILVUS_METRIC = "COSINE"  # bge-m3 向量已 L2 归一化，COSINE 与点积等价
+MILVUS_INDEX = "HNSW"
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))  # bge-m3 输出维度
 
 # 向量编码模型（bge-m3）与大模型（qwen-max）
 BGE_MODEL_PATH = "/Users/chan/projects/Itcast_qa_system/rag_qa/models/bge-m3"
 LLM_MODEL = "qwen-max"
-DASHSCOPE_API_KEY = os.getenv("API_KEY")
+DASHSCOPE_API_KEY = os.getenv("API_KEY") or "api_key"
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # 检索参数

@@ -98,3 +98,42 @@ def test_crossref_edges():
     # 引用的条文不在同法内（KP_039 属于 other.md）→ 不加 crossref 边
     e_65_39 = edges.get(("KP_039", "KP_065"))
     assert e_65_39 is None or "crossref" not in e_65_39["types"]
+
+
+def _kp_part(i, part, chapter, clause):
+    return KnowledgePoint(
+        id=f"KP_{i:03d}", title=f"{part}·{chapter}·{clause}", chapter=chapter,
+        chapter_title="", part=part, part_title="", clause=clause,
+        content="内容", keywords=[], source="中华人民共和国民法典.md L1",
+    )
+
+
+def test_sibling_edges_scoped_by_part():
+    """民法典各编章号重新起算：sibling 边必须按 (编, 章) 分组，跨编同号章不得成团。"""
+    pts = [
+        _kp_part(1, "第一编", "第一章", "第一条"),
+        _kp_part(2, "第一编", "第一章", "第二条"),
+        _kp_part(3, "第二编", "第一章", "第一千条"),
+    ]
+    graph = build_graph(pts)
+    edges = {(e["source"], e["target"]) for e in graph["edges"]}
+    assert ("KP_001", "KP_002") in edges            # 同编同章 → 兄弟
+    assert edges == {("KP_001", "KP_002")}          # 跨编同号章不建边
+    assert graph["nodes"][2]["part"] == "第二编"     # 节点带编信息
+
+
+def test_crossref_supports_thousand_article():
+    """千位条号的交叉引用也要能建 crossref 边（民法典大量引用第1000条以上条文）。"""
+    pts = [
+        KnowledgePoint(id="KP_001", title="第一章·第一千条", chapter="第一章",
+                       chapter_title="", clause="第一千条",
+                       content="参照适用本法第一千二百六十条的规定。", keywords=[],
+                       source="中华人民共和国民法典.md L1"),
+        KnowledgePoint(id="KP_002", title="第十章·第一千二百六十条", chapter="第十章",
+                       chapter_title="", clause="第一千二百六十条",
+                       content="本法自2021年1月1日起施行。", keywords=[],
+                       source="中华人民共和国民法典.md L2"),
+    ]
+    graph = build_graph(pts)
+    edges = {(e["source"], e["target"]): e for e in graph["edges"]}
+    assert "crossref" in edges[("KP_001", "KP_002")]["types"]

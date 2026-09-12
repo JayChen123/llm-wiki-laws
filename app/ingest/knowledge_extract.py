@@ -2,8 +2,9 @@
 
 markitdown 转换产物含较多噪音（页眉日期、孤立页码、目录/元数据、
 网页页脚），且部分法律 PDF 的文本使用康熙部首变体字符（如"第⼀条"）。
-本模块先做清洗与字符规范化，再按"章（第X章）→ 节（第X节）→ 条（第X条）"
-层级切分知识点（粒度：每一条一个知识点），并抽取关键词。
+本模块先做清洗与字符规范化，再按"编（第X编）→ 章（第X章）→ 节（第X节）→ 条（第X条）"
+层级切分知识点（粒度：每一条一个知识点），并抽取关键词。编为可选层级（民法典有，
+劳动法/劳动合同法没有）；民法典各编章号重新起算，故编必须参与去重与分组。
 
 关键判别：
 - 章/节/条标题在**原始行**（保留空白）上检测，要求"第X章/节/条"后紧跟空白，
@@ -26,10 +27,18 @@ _KANGXI_TABLE = str.maketrans({
     for c in range(0x2F00, 0x2FD6)
 } | {"⺠": "民", "⻅": "见", "⻓": "长", "⻔": "门"})
 
-# 章/节/条边界（原始行，要求"第X章/节/条"后跟空白；数字含"零"，否则漏掉第一百零一条等）
-_CHAPTER_RE = re.compile(r"^第([一二三四五六七八九十百零]+)章[　\s]+(.+)$")
-_SECTION_RE = re.compile(r"^第([一二三四五六七八九十百零]+)节[　\s]+(.+)$")
-_ARTICLE_RE = re.compile(r"^第([一二三四五六七八九十百零]+)条[　\s]+(.*)$")
+# 中文数字字符集（编/章/节/条编号通用）。
+# 含"千"：民法典"第一千二百六十条"等千位条号；含"零"：第一百零一条等；
+# 缺任一个都会整段漏切（民法典曾因缺"千"丢失第1000-1260条共261条）。
+CN_NUM_CHARS = "一二三四五六七八九十百千零"
+
+# 编/章/节/条边界（原始行，要求"第X编/章/节/条"后跟空白）
+_PART_RE = re.compile(rf"^第([{CN_NUM_CHARS}]+)编[　\s]+(.+)$")
+# "分编"（民法典物权编/合同编内部的分组）不单独建模，只作结构边界
+_SUBPART_RE = re.compile(rf"^第([{CN_NUM_CHARS}]+)分编[　\s]+(.+)$")
+_CHAPTER_RE = re.compile(rf"^第([{CN_NUM_CHARS}]+)章[　\s]+(.+)$")
+_SECTION_RE = re.compile(rf"^第([{CN_NUM_CHARS}]+)节[　\s]+(.+)$")
+_ARTICLE_RE = re.compile(rf"^第([{CN_NUM_CHARS}]+)条[　\s]+(.*)$")
 
 # 法律领域高频通用词：过滤后降低关键词边的重合密度
 _LEGAL_STOPWORDS = {
@@ -42,8 +51,8 @@ _LEGAL_STOPWORDS = {
 _CN_DIGITS = "零一二三四五六七八九"
 
 
-def _cn_num(s: str) -> int:
-    """中文数字转整数（支持个/十/百/零，如 九十八→98、一百零三→103）。"""
+def cn_to_int(s: str) -> int:
+    """中文数字转整数（支持个/十/百/千/零，如 九十八→98、一百零三→103、一千二百六十→1260）。"""
     total = 0
     num = 0
     for ch in s:
@@ -57,6 +66,9 @@ def _cn_num(s: str) -> int:
         elif ch == "百":
             total += (num if num else 1) * 100
             num = 0
+        elif ch == "千":
+            total += (num if num else 1) * 1000
+            num = 0
     return total + num
 
 
@@ -65,17 +77,21 @@ _NOISE_KEYWORDS = (
     "加入收藏", "网站无障碍", "网站声明", "网站管理", "网站地图", "联系我们",
     "网站值班", "主办单位", "京ICP", "网站标识码", "版权所有", "版权",
 )
-_DATE_RE = re.compile(r"^\d{4}/\d{1,2}/\d{1,2}")
+# 页眉日期两种写法：2024/11/15（转换日，可带时间）、8/23/2020（网页日期）
+_DATE_RE = re.compile(r"^(?:\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})(?!\d)")
 _PAGE_MARKER_RE = re.compile(r"^\d+/\d+$")
-_URL_RE = re.compile(r"^https?://")
+# 裸域名也要过滤：民法典页眉是 www.npc.gov.cn/... （无协议前缀）
+_URL_RE = re.compile(r"^(?:https?://|www\.)")
 
 
 @dataclass
 class KnowledgePoint:
     id: str
-    title: str                       # 知识点标题，如"第五章·第五十七条"
+    title: str                       # 知识点标题，如"第五章·第五十七条"（有编时为"第二编 物权·第二章·第十三条"）
     chapter: str                     # 章节号，如"第五章"
     chapter_title: str               # 章节标题，如"特别规定"
+    part: str = ""                   # 编号，如"第二编"（无"编"的法律为空）
+    part_title: str = ""             # 编标题，如"物权"；民法典 7 编各自重排章号，靠它区分同号章
     clause: str = ""                 # 条文，如"第五十七条"（节内为"第X节 节名·第X条"）
     content: str = ""                # 清洗后的正文
     keywords: list = field(default_factory=list)  # 关键词
@@ -136,11 +152,20 @@ def _smart_join(a: str, b: str) -> str:
 
 
 def extract_knowledge_points(md_path: Path) -> list[KnowledgePoint]:
-    """从 markdown 文件提取知识点列表（粒度：章→节→条，每一条一个知识点）。"""
-    raw_lines = md_path.read_text(encoding="utf-8").splitlines()
+    """从 markdown 文件提取知识点列表（粒度：编→章→节→条，每一条一个知识点）。"""
+    # 按物理行（仅 \n）拆分：splitlines() 会把换页符 \f 也当换行，
+    # 使 source 行号比编辑器实际行号大（民法典 130 处 \f，漂移 129 行，溯源对不上）。
+    raw_lines = md_path.read_text(encoding="utf-8").split("\n")
+    # 一物理行内的 \f 是页分隔符，拆成多段但共用同一物理行号：
+    # 行号与编辑器一致，且页眉噪音仍能逐段过滤
+    segments: list[tuple[int, str]] = [
+        (line_no, seg)
+        for line_no, line in enumerate(raw_lines, 1)
+        for seg in line.split("\f")
+    ]
 
     points: list[KnowledgePoint] = []
-    chapter = chapter_title = section = clause = ""
+    part = part_title = chapter = chapter_title = section = clause = ""
     buf: list[str] = []
     start_line = 0
     body = False  # 是否已进入正文（首个"第X条"之后）
@@ -148,14 +173,19 @@ def extract_knowledge_points(md_path: Path) -> list[KnowledgePoint]:
 
     def flush() -> None:
         nonlocal buf
-        if buf and chapter and body:
+        # 必须有 clause：章/节标题本身不是知识点（民法典页眉噪音曾让 34 个章标题单独成点）
+        if buf and chapter and clause and body:
             content = "\n".join(buf)
-            title = f"{chapter}·{clause}" if clause else f"{chapter} {chapter_title}"
+            # 有"编"时标题带编名（如"第二编 物权·第二章·第十三条"）：
+            # 编名（物权/婚姻家庭/继承/侵权责任）参与 BM25 索引与语义编码，且便于 LLM 区分同号章
+            head = f"{part} {part_title}·{chapter}" if part else chapter
             kp = KnowledgePoint(
                 id=f"KP_{len(points) + 1:03d}",
-                title=title,
+                title=f"{head}·{clause}",
                 chapter=chapter,
                 chapter_title=chapter_title,
+                part=part,
+                part_title=part_title,
                 clause=clause,
                 content=content,
                 source=f"{md_path.name} L{start_line}-{line_no}",
@@ -165,14 +195,35 @@ def extract_knowledge_points(md_path: Path) -> list[KnowledgePoint]:
         buf = []
 
     def handle_header(stripped: str, this_line: int) -> bool:
-        """在保留空白的原始行上检测章/节/条头；命中则更新状态并返回 True。
+        """在保留空白的原始行上检测编/章/节/条头；命中则更新状态并返回 True。
 
         先做康熙部首归一化（法律 PDF 常用"第⼀条"变体，原始行不匹配数字字符类），
         再匹配正则；空白判定仍基于归一化前/后一致的空白，正文折行处的交叉引用
-        （"第三十九条和第四十条"，条后无空白）依旧被排除。
+        （"第三十九条和第四十条"，条后无空白）依旧被排除。正则均以 ^ 锚定行首，
+        故正文中"依照本法第一编第六章…"这类跨引用不会被误判为层级标题。
         """
-        nonlocal chapter, chapter_title, section, clause, buf, start_line, body, current_article_no
+        nonlocal part, part_title, chapter, chapter_title, section, clause, buf, start_line, body, current_article_no
         stripped = stripped.translate(_KANGXI_TABLE)
+        pm = _PART_RE.match(stripped)
+        if pm:
+            flush()
+            part = f"第{pm.group(1)}编"
+            part_title = _normalize(pm.group(2))
+            # 编内章号重新起算，章上下文必须一并清空，避免章标题前的内容挂到上一编
+            chapter = chapter_title = section = clause = ""
+            buf = []
+            start_line = this_line
+            return True
+        sbm = _SUBPART_RE.match(stripped)
+        if sbm:
+            # 分编标题（如"第二分编 典型合同"）不产生知识点，但必须是结构边界：
+            # 否则标题文字会被并入上一条文正文（民法典曾有 6 条正文被污染）。
+            # 所属"编"不变，仅重置其下的章上下文。
+            flush()
+            chapter = chapter_title = section = clause = ""
+            buf = []
+            start_line = this_line
+            return True
         m = _CHAPTER_RE.match(stripped)
         if m:
             flush()
@@ -193,7 +244,7 @@ def extract_knowledge_points(md_path: Path) -> list[KnowledgePoint]:
             return True
         am = _ARTICLE_RE.match(stripped)
         if am and chapter:
-            no = _cn_num(am.group(1))
+            no = cn_to_int(am.group(1))
             if no < current_article_no:
                 return False             # 交叉引用（条文号带空白），按正文继续
             current_article_no = no
@@ -208,19 +259,18 @@ def extract_knowledge_points(md_path: Path) -> list[KnowledgePoint]:
         return False
 
     i = 0
-    n = len(raw_lines)
+    n = len(segments)
     while i < n:
-        raw = raw_lines[i]
-        line_no = i + 1
+        line_no, raw = segments[i]
         stripped = raw.lstrip(" \t　")
         if not stripped:
             i += 1
             continue
         if stripped.startswith("|"):       # 表格块（目录或正文表格）
             j = i
-            while j < n and raw_lines[j].lstrip().startswith("|"):
+            while j < n and segments[j][1].lstrip().startswith("|"):
                 j += 1
-            for row in _process_table("\n".join(raw_lines[i:j])):
+            for row in _process_table("\n".join(s for _, s in segments[i:j])):
                 if handle_header(row, line_no):
                     continue
                 if body and chapter:       # 正文表格：内容并入当前条文
@@ -255,11 +305,11 @@ def extract_knowledge_points(md_path: Path) -> list[KnowledgePoint]:
 
 
 def extract_keywords(kp: KnowledgePoint, content: str, top_k: int = 8) -> list[str]:
-    """基于 jieba TF-IDF 抽取正文关键词，并入章节/条文清洗后的主题词，过滤法律停用词。"""
+    """基于 jieba TF-IDF 抽取正文关键词，并入编/章节/条文清洗后的主题词，过滤法律停用词。"""
     tags = jieba.analyse.extract_tags(content, topK=top_k)
     extra = []
-    for part in (kp.clause, kp.chapter_title):
-        cleaned = re.sub(r"第[一二三四五六七八九十百零]+[章节条]", "", part)
+    for field in (kp.clause, kp.chapter_title, kp.part_title):
+        cleaned = re.sub(rf"第[{CN_NUM_CHARS}]+[编章节条]", "", field)
         cleaned = re.sub(r"[\s·、，。；：（）()\"'《》]", "", cleaned)
         if cleaned:
             extra.append(cleaned)

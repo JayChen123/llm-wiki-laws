@@ -14,11 +14,12 @@ import re
 import numpy as np
 
 from app.config import GRAPH_PATH
-from app.ingest.knowledge_extract import KnowledgePoint
+from app.ingest.knowledge_extract import CN_NUM_CHARS, KnowledgePoint
 from app.retrieval.embedder import Embedder
 
-# 正文交叉引用：如"依照本法第三十九条……"（条文号用中文数字，含"零"）
-_ART_REF_RE = re.compile(r"第[一二三四五六七八九十百零]+条")
+# 正文交叉引用：如"依照本法第三十九条……"（条文号用中文数字，含"千/零"，
+# 否则民法典"第一千一百六十五条"这类跨引用边建不出来）
+_ART_REF_RE = re.compile(rf"第[{CN_NUM_CHARS}]+条")
 # 交叉引用是直接的法条间链接，权重高于章节结构边，保证图谱扩展优先带到被引用条文
 _CROSSREF_WEIGHT = 1.5
 
@@ -30,19 +31,35 @@ def _jaccard(a: list[str], b: list[str]) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
+def semantic_text(point: KnowledgePoint) -> str:
+    """语义编码文本：标题（含编名）+ 正文前 200 字。
+
+    语义边与向量库写入必须共用这一模板，否则图谱语义与检索语义不一致；
+    需要编码时统一走此函数，避免两处各写一份模板。
+    """
+    return f"{point.title}\n{point.content[:200]}"
+
+
 def build_graph(
         points: list[KnowledgePoint],
         embedder: Embedder | None = None,
+        vectors=None,
         keyword_threshold: float = 0.3,
         semantic_threshold: float = 0.75,
 ) -> dict:
-    """构建知识图谱，返回 {nodes, edges}。"""
+    """构建知识图谱，返回 {nodes, edges}。
+
+    `vectors` 可直接传入已算好的知识点向量（与 `points` 同序），避免重复编码；
+    未传且给了 `embedder` 时才自行编码。
+    """
     nodes = [
         {
             "id": p.id,
             "title": p.title,
             "chapter": p.chapter,
             "chapter_title": p.chapter_title,
+            "part": p.part,
+            "part_title": p.part_title,
             "clause": p.clause,
             "keywords": p.keywords,
             "content": p.content,
@@ -61,11 +78,13 @@ def build_graph(
             entry["types"].append(etype)
         entry["weight"] = max(entry["weight"], weight)
 
-    # 1) 结构关联：同章节内的一级条款互为兄弟
-    by_chapter: dict[str, list[KnowledgePoint]] = {}
+    # 1) 结构关联：同章节内的一级条款互为兄弟。
+    #    分组键必须是 (编, 章)：民法典 7 编各自从"第一章"重新起算，
+    #    只按章号分组会把不同编的同号章并成一个大团（曾产生 3 万余条假边）。
+    by_chapter: dict[tuple[str, str], list[KnowledgePoint]] = {}
     for p in points:
-        by_chapter.setdefault(p.chapter, []).append(p)
-    for chapter, items in by_chapter.items():
+        by_chapter.setdefault((p.part, p.chapter), []).append(p)
+    for items in by_chapter.values():
         clauses = [p for p in items if p.clause]
         for i in range(len(clauses)):
             for j in range(i + 1, len(clauses)):
@@ -78,13 +97,13 @@ def build_graph(
             if jac >= keyword_threshold:
                 add_edge(points[i].id, points[j].id, "keyword", round(jac, 4))
 
-    # 3) 语义相似度（可选，需要向量编码器）
-    if embedder is not None:
-        texts = [f"{p.title}\n{p.content[:200]}" for p in points]  # 用知识点的标题和内容的前200字作用语义编码
-        vecs = embedder.encode(texts)
+    # 3) 语义相似度（可选，需要向量或编码器）
+    if vectors is None and embedder is not None:
+        vectors = embedder.encode([semantic_text(p) for p in points])
+    if vectors is not None:
         for i in range(len(points)):
             for j in range(i + 1, len(points)):
-                cos = float(np.dot(vecs[i], vecs[j]))
+                cos = float(np.dot(vectors[i], vectors[j]))
                 if cos >= semantic_threshold:
                     add_edge(points[i].id, points[j].id, "semantic", round(cos, 4))
 
@@ -96,7 +115,7 @@ def build_graph(
     for pts in by_law.values():
         ref_to_id: dict[str, str] = {}
         for p in pts:
-            m = re.search(r"第[一二三四五六七八九十百零]+条$", p.clause)
+            m = re.search(rf"第[{CN_NUM_CHARS}]+条$", p.clause)
             if m:
                 ref_to_id.setdefault(m.group(0), p.id)
         for p in pts:

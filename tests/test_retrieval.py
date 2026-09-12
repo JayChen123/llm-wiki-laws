@@ -45,6 +45,23 @@ class StubEmbedder(Embedder):
         return out
 
 
+class StubVectorStore:
+    """内存版向量库：模拟 Milvus 的 [(kp_id, score)] 返回，保证检索测试离线可跑。"""
+
+    def __init__(self, nodes, vectors):
+        self.ids = [n["id"] for n in nodes]
+        self.vectors = np.asarray(vectors, dtype=np.float32)
+
+    def search(self, query_vector, top_k=5):
+        cos = self.vectors @ np.asarray(query_vector, dtype=np.float32)
+        order = cos.argsort()[::-1][:top_k]
+        return [(self.ids[int(i)], float(cos[int(i)])) for i in order]
+
+
+def _vector_retriever(nodes, vectors, embedder):
+    return VectorRetriever(nodes, StubVectorStore(nodes, vectors), embedder)
+
+
 def test_keyword_retrieval():
     kr = KeywordRetriever(_nodes())
     results = kr.search("请假流程", top_k=2)
@@ -74,7 +91,7 @@ def test_vector_retrieval():
     nodes = _nodes()
     emb = StubEmbedder()
     vecs = emb.encode([n["title"] + n["content"] for n in nodes])
-    vr = VectorRetriever(nodes, vecs, emb)
+    vr = _vector_retriever(nodes, vecs, emb)
     results = vr.search("请假流程", top_k=2)
     assert results and results[0][0]["id"] == "KP_001"
 
@@ -85,7 +102,7 @@ def test_hybrid_rrf_and_expansion():
     emb = StubEmbedder()
     vecs = emb.encode([n["title"] + n["content"] for n in nodes])
     kr = KeywordRetriever(nodes)
-    vr = VectorRetriever(nodes, vecs, emb)
+    vr = _vector_retriever(nodes, vecs, emb)
     hr = HybridRetriever(nodes, graph, kr, vr, expand_k=2)
 
     results = hr.search("请假流程", top_k=2)
@@ -125,7 +142,7 @@ def test_hybrid_multi_hop_expansion():
     emb = StubEmbedder()
     vecs = emb.encode([n["title"] + n["content"] for n in nodes])
     kr = KeywordRetriever(nodes)
-    vr = VectorRetriever(nodes, vecs, emb)
+    vr = _vector_retriever(nodes, vecs, emb)
     # 3 跳扩展：C 是 A 的二跳邻居，应被多跳扩展召回
     hr = HybridRetriever(nodes, graph, kr, vr, expand_k=3, expand_hops=3, expand_decay=0.5)
 
@@ -143,7 +160,7 @@ def test_multi_hop_fraction_after_seed():
     graph = _chain_graph()
     emb = StubEmbedder()
     vecs = emb.encode([n["title"] + n["content"] for n in nodes])
-    hr = HybridRetriever(nodes, graph, KeywordRetriever(nodes), VectorRetriever(nodes, vecs, emb),
+    hr = HybridRetriever(nodes, graph, KeywordRetriever(nodes), _vector_retriever(nodes, vecs, emb),
                          expand_k=3, expand_hops=3, expand_decay=0.5)
     results = hr.search("请假", top_k=1)
     assert results[0]["id"] == "KP_A"

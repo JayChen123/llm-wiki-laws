@@ -61,7 +61,8 @@ def build_rows(
             for r in results
         ]
         retrieved_ids = [r["id"] for r in results]
-        # 检索返回 top_k 基础块 + 图谱扩展块，生成器取全部（<=8）；@8 反映真实上下文
+        # 检索返回 top_k 个种子 + 至多 EXPAND_K 个图谱扩展块，全部交给生成器；
+        # recall 仍按 @1/3/5/8 汇报（@8 沿用历史基线口径，非生成器上下文上限）
         recall = recall_report(retrieved_ids, case["expected_knowledge"], ks=(1, 3, 5, 8))
 
         answer = ""

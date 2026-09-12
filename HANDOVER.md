@@ -1,13 +1,13 @@
 # 项目交接文档
 
 > 本文档用于交接，供后续接入的大模型（或开发者）快速掌握本项目全貌，无需重新摸索即可继续开发。
-> 最后更新：2026-08-12
+> 最后更新：2026-09-13（v1.1：新增《民法典》、向量迁移至 Milvus）
 
 ---
 
 ## 0. 一句话速览
 
-基于 **llm-wiki** 理念构建的**劳动法知识问答系统**（**非 RAG**）：将《中华人民共和国劳动法》《中华人民共和国劳动合同法》PDF 提前"编译"为**结构化知识点 + 关联图谱**，查询时通过**关键词(BM25) + 向量(bge-m3) 混合检索**定位知识点，由大模型 **qwen-max** 综合生成回答，带**短期记忆**（SQLite）支持多轮对话，并提供 **Ragas 评估**体系。
+基于 **llm-wiki** 理念构建的**法律知识问答系统**（**非 RAG**）：将《中华人民共和国劳动法》《中华人民共和国劳动合同法》《中华人民共和国民法典》提前"编译"为**结构化知识点 + 关联图谱**（1465 个知识点 / 21252 条边），查询时通过**关键词(BM25) + 向量(bge-m3，存于 Milvus) 混合检索**定位知识点，由大模型 **qwen-max** 综合生成回答，带**短期记忆**（SQLite）支持多轮对话，并提供 **Ragas 评估**体系。
 
 ---
 
@@ -22,8 +22,8 @@
 | 存储载体 | 向量数据库 | Markdown 页面集 + JSON 图谱 |
 | 查询行为 | 检索→拼接→推理 | 定位知识点 → 综合生成 |
 
-- **不切块**：文档按"章（第X章）→ 节（第X节）→ 条（第X条）"切分为知识点（KnowledgePoint），**粒度：每一条一个知识点**，而非定长 chunk。
-- **向量不承载知识库**：bge-m3 仅用于（a）语义关联边构建、（b）查询时向量召回融合；知识本体在 `wiki/` 与 `knowledge_graph.json`。
+- **不切块**：文档按"编（第X编）→ 章（第X章）→ 节（第X节）→ 条（第X条）"切分为知识点（KnowledgePoint），**粒度：每一条一个知识点**，而非定长 chunk。
+- **向量不承载知识库**：bge-m3 仅用于（a）语义关联边构建、（b）查询时向量召回融合；知识本体在 `wiki/` 与 `knowledge_graph.json`。向量**存于 Milvus** 只是把它当"向量索引"用，不是知识载体（`.npy` 文件缓存已废弃）。
 - **多跳支持**：检索后沿关联图 BFS 扩展（最多 3 跳）+ prompt 引导 LLM 跨知识点推理。
 
 ---
@@ -32,18 +32,19 @@
 
 - Python **3.13+**，虚拟环境由 **uv** 管理（环境已就绪）。
 - 依赖见 `pyproject.toml`：
-  - **核心**：`jieba`、`markitdown[pdf]`、`openai`、`rank-bm25`、`sentence-transformers`
+  - **核心**：`jieba`、`markitdown[pdf]`、`openai`、`rank-bm25`、`sentence-transformers`、**`pymilvus>=2.5,<2.6`**
   - **dev**：`pytest`、`ragas==0.3.0`、`dashscope`、`langchain`(最新)、`langchain-community==0.4.0`、`langchain-core`、`langchain-openai`
 - **关键版本约束**（踩坑后确定的兼容组合）：
   - `ragas==0.3.0` + `langchain-community==0.4.0` + langchain 最新（1.x）为**已验证兼容**组合。
   - ragas 0.4.x 与 langchain-community≥0.4.2 不兼容（`vertexai` 模块被移除）；langchain 0.3 栈与 ragas 0.2.x 的 `agenerate_prompt` API 不兼容。**不要随意改动这三个的版本组合**。
-- 本地 bge-m3 模型路径见根 `config.py` 的 `bge_m3`。
+- 本地 bge-m3 模型路径见 `app/config.py` 的 `BGE_MODEL_PATH`（**根 `config.py` 已不存在**，历史文档里的"双份配置"说法已作废）。
+- 向量库用 **Milvus**（`pymilvus>=2.5,<2.6`；2.4.x 在 Python 3.13 上无法导入），服务端见 `docker/docker-compose.yml`。
 
 ### 常用命令
 ```bash
 uv run python -m app.ingest.pipeline     # 构建知识库（全量重建，幂等）
 uv run python -m app.cli                 # 启动命令行问答
-uv run python -m pytest tests/ -v        # 运行全部测试（当前 42 项）
+uv run python -m pytest tests/ -v        # 运行全部测试（当前 67 项）
 uv run python -m eval.evaluate --limit 3 # 评估（试跑3条）
 uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/3/5/8）
 ```
@@ -54,7 +55,6 @@ uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/
 
 ```
 llm_wiki_laws/
-├── config.py               # 配置单一来源（用户维护）：模型路径、LLM、DB 等
 ├── pyproject.toml          # 依赖（uv 管理）
 ├── uv.lock                 # 锁文件（提交）
 ├── CLAUDE.md               # 开发规范（先理解→方案→确认→编码；测试后验收）
@@ -65,45 +65,49 @@ llm_wiki_laws/
 ├── data/
 │   ├── src/                # 原始 PDF 源文件（新增放这里）
 │   │   ├── 中华人民共和国劳动合同法.pdf
+│   │   ├── 中华人民共和国民法典.pdf
 │   │   └── 中华人民共和国劳动法_中华人民共和国人力资源和社会保障部.pdf
 │   └── raw/                # markdown 原始文件（PDF产物 + 用户直接放入）
 │       ├── 中华人民共和国劳动合同法.md
+│       ├── 中华人民共和国民法典.md          # 7 编 1260 条，含"编/分编"与千位条号
 │       └── 中华人民共和国劳动法_中华人民共和国人力资源和社会保障部.md
+├── docker/
+│   └── docker-compose.yml  # Milvus v2.4.4 + etcd/minio + redis + mysql（端口见文件）
 ├── app/
-│   ├── config.py           # 应用配置（复用根 config.py，含路径与检索参数）
+│   ├── config.py           # 应用配置（**唯一配置源**：路径、bge-m3、LLM、Milvus、检索参数）
 │   ├── kb.py               # 知识库加载与统一检索入口
 │   ├── cli.py              # 命令行交互式问答（含短期记忆 + 日志）
 │   ├── logger.py           # 结构化问答日志
 │   ├── ingest/             # ① 知识构建管线
 │   │   ├── pipeline.py         # 管线入口（PDF→MD→知识点→图谱→Wiki）
 │   │   ├── pdf_to_markdown.py  # markitdown 转换
-│   │   ├── knowledge_extract.py# 清洗 + 章/节/条切分提取知识点
+│   │   ├── knowledge_extract.py# 清洗 + 编/章/节/条切分提取知识点
 │   │   ├── concept_map.py      # 法律概念→条文映射表 + 关键词增强
 │   │   ├── graph_build.py      # 关联图谱构建（4 类边）
 │   │   └── wiki_writer.py      # Wiki 页面落盘（含核心概念导航）
 │   ├── retrieval/          # ② 混合检索
-│   │   ├── embedder.py         # bge-m3 向量编码（含 DummyEmbedder 测试用）
+│   │   ├── embedder.py         # bge-m3 向量编码（测试用假编码器在各测试文件内定义）
+│   │   ├── vector_store.py     # Milvus 向量库：建集合/全量对齐写入/余弦检索
 │   │   ├── keyword_retriever.py# BM25 关键词检索（索引含关键词字段）
-│   │   ├── vector_retriever.py # bge-m3 向量检索
+│   │   ├── vector_retriever.py # bge-m3 编码 query → Milvus 检索 → 映射回图谱节点
 │   │   └── hybrid_retriever.py # RRF 融合 + 图谱多跳扩展
 │   ├── generation/         # ③ 回答生成
 │   │   └── answer.py           # qwen-max 流式生成（法律领域 prompt）
 │   └── memory/             # ④ 短期记忆
 │       └── memory_store.py     # SQLite 存储
-├── wiki/                   # 编译出的知识库（llm-wiki 页面集，可重新生成，被 gitignore）
-│   ├── index.md            #   知识索引（核心概念导航 + 按源文档分组）
+├── wiki/                   # 编译出的知识库（llm-wiki 页面集，可重新生成）
+│   ├── index.md            #   知识索引（核心概念导航 + 按源文档分组；有"编"的法律按 编→章 两级）
 │   ├── log.md              #   构建日志
-│   ├── knowledge_vectors.npy  # 知识点向量缓存（bge-m3）
 │   └── concepts/KP_*.md    #   每个知识点一页（含双向链接）
 ├── knowledge_graph.json    # 知识点关联图谱（可重新生成，被 gitignore）
 ├── logs/qa.log             # 问答日志（被 gitignore）
 ├── memory.db               # 短期记忆 SQLite（运行生成，被 gitignore）
 ├── eval/                   # 评估（Ragas 0.3）
-│   ├── qa_test_cases.jsonl #   30 条法律评估用例
+│   ├── qa_test_cases.jsonl #   35 条法律评估用例
 │   ├── metrics.py          #   recall@k 指标（自定义）
 │   ├── evaluate.py         #   评估主程序
 │   └── results/            #   结果输出（被 gitignore）
-└── tests/                  # 单元测试（pytest，42 项）
+└── tests/                  # 单元测试（pytest，67 项；全部离线，不连 Milvus/大模型）
 ```
 
 ---
@@ -116,7 +120,7 @@ llm_wiki_laws/
 
 流水线每次运行：PDF→MD 为增量；MD→知识点→图谱→Wiki 为**全量幂等重建**（md 更新即生效）。
 
-当前知识库：**205 个知识点**（劳动合同法 98 条 + 劳动法 107 条）、**2962 条关联边**。
+当前知识库：**1465 个知识点**（劳动合同法 98 条 + 劳动法 107 条 + **民法典 1260 条**）、**21252 条关联边**；向量存于 Milvus 集合 `llm_wiki_laws`（1465 条，dim 1024，HNSW/COSINE）。
 
 ---
 
@@ -124,17 +128,14 @@ llm_wiki_laws/
 
 ### 5.1 配置层
 
-**根 `config.py`**（用户维护，单一配置源，应用通过 `app/config.py` 复用）：
-- `bge_m3`：bge-m3 模型路径（本地）
-- `bge_reranker`：reranker 路径（当前未使用）
-- `model`/`dashscope_api_key`/`dashscope_base_url`：大模型配置（qwen-max，DashScope OpenAI 兼容接口，key 读 `API_KEY` 环境变量）
-- 另有 MySQL/Redis/Milvus 配置，**本项目未使用**，勿被误导。
+⚠️ **根 `config.py` 不存在**（未纳入 git，工作区里也没有）。历史文档写的"根 config.py 用户维护 + app/config.py 复用"已经不成立，`app/config.py` 里那行 `# from config import Config` 是注释掉的。**配置只有 `app/config.py` 一处**。
 
 **`app/config.py`**：
 - `SRC_DIR` / `RAW_DIR`：`data/src` / `data/raw`
-- `WIKI_DIR` / `CONCEPTS_DIR` / `GRAPH_PATH` / `VECTOR_CACHE_PATH` / `MEMORY_DB_PATH`
-- `BGE_MODEL_PATH` / `LLM_MODEL` / `DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL`（来自根 config）
-- 检索参数：`TOP_K=5`、`EXPAND_K=3`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`
+- `WIKI_DIR` / `CONCEPTS_DIR` / `GRAPH_PATH` / `MEMORY_DB_PATH`
+- `BGE_MODEL_PATH`（**本地模型路径，机器相关，换环境先改这里**；指向 Itcast 目录仅是用户提供的配置值，**不作为实现参考**）/ `LLM_MODEL` / `DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL`
+- **Milvus**：`MILVUS_HOST` / `MILVUS_PORT`（默认 **19532**，是宿主机映射端口，容器内是 19530）/ `MILVUS_COLLECTION` / `MILVUS_METRIC=COSINE` / `MILVUS_INDEX=HNSW` / `EMBED_DIM=1024`，均可用环境变量覆盖
+- 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（生成上下文最多 15 块）
 
 ### 5.2 知识构建管线（`app/ingest/`）
 
@@ -145,56 +146,70 @@ llm_wiki_laws/
 - `run_pipeline()`：转 PDF → 提知识点 → 概念关键词增强 → bge-m3 语义向量（缓存）→ 建图谱 → 落盘 Wiki
 
 **`knowledge_extract.py`**（知识点提取核心，面向法律法规文档）：
-- `KnowledgePoint` dataclass：`id/title/chapter/chapter_title/clause/content/keywords/source`，**粒度：每一条一个知识点**（节内为 `第X节 节名·第X条`）
-- **章/节/条边界**：在**原始行**（保留空白）上检测，要求"第X章/节/条"后紧跟空白 → 排除正文折行处的交叉引用（"第三十九条和第四十条…"条后无空白）。数字含"零"（否则漏掉第一百零一条）。
+- `KnowledgePoint` dataclass：`id/title/chapter/chapter_title/part/part_title/clause/content/keywords/source`，**粒度：每一条一个知识点**（节内为 `第X节 节名·第X条`）
+- **编/章/节/条边界**：在**原始行**（保留空白）上检测，要求"第X编/章/节/条"后紧跟空白 → 排除正文折行处的交叉引用（"第三十九条和第四十条…"条后无空白）。数字字符集 `CN_NUM_CHARS` **必须含"千"**（民法典第一千二百六十条）**和"零"**（第一百零一条）——缺"千"会让民法典从第 1000 条起整段漏切（曾只抽到 999/1260 条）。
+- **"编"是必需层级**：`part`/`part_title`；民法典 7 编各自从"第一章"重新起算，`title` 形如 `第二编 物权·第二章·第十三条`（编名参与 BM25 索引与语义编码）。`_PART_RE` 以 `^` 锚定行首，故正文"依照本法第一编第六章…"不会误判。
+- **"分编"只作结构边界**（`_SUBPART_RE`）：民法典物权编/合同编内部的分组标题，既不产生知识点、也不并入上一条文正文（曾污染 6 条条文正文），仅重置章上下文。
+- **章/节标题不产生知识点**：`flush()` 要求 `clause` 非空（否则页眉噪音会让章标题单独成点，曾产生 34 个垃圾知识点）。
 - **康熙部首归一**：法律 PDF 文本用康熙部首变体（如"第⼀条"U+2F00）；`_KANGXI_TABLE` 用 NFKC 归一 + 手工映射（⺠→民、⻅→见、⻓→长、⻔→门），**在匹配正则前对行做 translate**。
-- **两阶段状态机**：正文首个"第X条"出现前视为"目录/元数据"阶段，只更新章/节上下文、丢弃内容行。
+- **行号按物理行**：源文件含换页符 `\f`（民法典 130 处），`splitlines()` 会把 `\f` 当换行、令 `source` 行号比编辑器实际行号大（民法典末尾偏移 129 行，溯源对不上）。现按 `\n` 拆物理行，行内再按 `\f` 分段并**共用同一行号**。
+- **两阶段状态机**：正文首个"第X条"出现前视为"目录/元数据"阶段，只更新编/章/节上下文、丢弃内容行。
 - **表格回填**：markdown 表格块若在正文阶段，行文本并入当前条文。
-- **噪音清洗**：页眉日期、页码、URL、网页脚注、目录点线统一过滤。
-- `extract_keywords()`：jieba TF-IDF + 章节/条文主题词，过滤法律停用词（用人单位/劳动者/应当…）。
+- **噪音清洗**：页眉日期（`2024/11/15` 与 `8/23/2020` 两种写法）、页码、URL（含**裸域名 `www.`**）、网页脚注、目录点线统一过滤。
+- `extract_keywords()`：jieba TF-IDF + 编/章节/条文主题词，过滤法律停用词（用人单位/劳动者/应当…）。
 
 **`concept_map.py`**（法律概念映射表，内容交付物）：
-- `CONCEPT_MAP`：法律概念 → (来源文档名关键字, 条文) 列表，如 `"试用期": [("劳动合同法","第十九条"), …]`。覆盖劳动合同订立/试用期/竞业限制/解除/经济补偿/集体合同/劳务派遣/非全日制/加班费/劳动监察/法律责任等 20+ 概念。
+- `CONCEPT_MAP`：法律概念 → (来源文档名关键字, 条文) 列表，如 `"试用期": [("劳动合同法","第十九条"), …]`。**共 53 个概念**：劳动法侧覆盖劳动合同订立/试用期/竞业限制/解除/经济补偿/集体合同/劳务派遣/非全日制/加班费/劳动监察/法律责任等；民法典侧覆盖诉讼时效/表见代理/监护/善意取得/居住权/抵押担保/格式条款/情势变更/合同法定解除/违约责任/违约金/借款/房屋租赁/无因管理/不当得利/隐私权/个人信息保护/婚姻无效/夫妻共同财产与共同债务/离婚冷静期/法定继承顺序/遗嘱继承/产品责任/交通事故/医疗损害/高空抛物等 27 个。
 - `CONCEPT_KEYWORDS`：概念 → 用户常用查询词（避免法律停用词），弥合"法律措辞（延长工作时间/工资报酬）↔ 用户口语（加班费）"鸿沟。
 - `concept_terms_for(point)`：按 `law in source` + `article in clause` **文档感知**匹配。
 - `enrich_keywords(points)`：把概念查询词注入对应条文知识点关键词（幂等）。
 
 **`graph_build.py`**（关联图谱）：
 - **四类边**：
-  - `sibling`：同章内条文（结构关联，权重 1.0）
+  - `sibling`：同 **(编, 章)** 内条文（结构关联，权重 1.0）。**分组键必须是二元组**——民法典 7 编各自从"第一章"起算，只按章号分组会把不同编的同号章并成大团（曾产生约 1.97 万条假边）
   - `keyword`：关键词 Jaccard 重合 ≥0.3
   - `semantic`：bge-m3 余弦 ≥0.75（实测调参：0.65 会近全连接）
-  - `crossref`：正文中"第X条"引用同法其他条文（权重 1.5，高于结构边，**跨法不加**）。这是多跳召回的关键——如 46 条引 38 条、65 条引 39 条、42 条引 45 条。
-- 输出 `{"nodes":[{id,title,chapter,chapter_title,clause,keywords,content,source}], "edges":[{source,target,types,weight}]}`
+  - `crossref`：正文中"第X条"引用同法其他条文（权重 1.5，高于结构边，**跨法不加**）。这是多跳召回的关键——如 46 条引 38 条、65 条引 39 条、42 条引 45 条。正则同样含"千"（民法典跨引用大量指向第 1000 条以上条文）
+- `semantic_text(point)`：语义编码文本模板（标题 + 正文前 200 字）。**语义边与向量库写入必须共用它**，否则图谱语义与检索语义不一致。
+- `build_graph(points, embedder=None, vectors=None, …)`：可直接传入已算好的 `vectors` 复用（避免重复编码）
+- 输出 `{"nodes":[{id,title,chapter,chapter_title,part,part_title,clause,keywords,content,source}], "edges":[{source,target,types,weight}]}`
 - `save_graph` / `load_graph`
 
 **`wiki_writer.py`**：
 - `write_wiki()`：生成 `wiki/index.md`（**核心概念导航** + 按源文档分组）、`wiki/concepts/KP_*.md`（含双向链接 `[[KP_xxx]]`）、`wiki/log.md`
+- `_index_md()`：**有"编"的法律按 编→章 两级分组**（`### 第二编 物权` → `#### 第二章`），无编的维持 doc→章 两级；排序用 `_order_no()`（复用 `cn_to_int`，支持"第二十九章"等）
 - `_resolve_concept(law, article, points)`：概念条文 → 知识点 id，未命中回退纯文本"《law》第X条"
 - `_concept_index_section(points)`：渲染"## 核心概念导航"，概念项链接到 `[[KP_xxx|第X条]]`
 
 ### 5.3 混合检索（`app/retrieval/`）
 
 **`embedder.py`**：
-- `Embedder`：基于 sentence-transformers 加载 bge-m3，`encode()` 输出 L2 归一化向量，`cache()` 缓存到 numpy 文件
-- `DummyEmbedder`：测试用假编码器（哈希随机投影），避免加载大模型
+- `Embedder`：基于 sentence-transformers 加载 bge-m3，`encode()` 输出 L2 归一化向量（dim 1024）
+- **不再有 `.npy` 文件缓存**（原 `cache()` 已删除）：它只按"文件是否存在"判断命中，知识库重建后易残留与实际节点集不一致的旧向量。测试用假编码器由各测试文件自带（`StubEmbedder`/`FakeEmbedder`）
+
+**`vector_store.py`**（Milvus 向量库）：
+- `MilvusVectorStore(client=None, …)`：`client` 可注入假 client 供离线测试
+- `ensure_collection()`：不存在则建（`kp_id` VARCHAR 主键 + `title`/`source` + `vector` FLOAT_VECTOR(1024)，HNSW(M=16, efConstruction=200) + COSINE）；已存在则校验维度，不一致就重建
+- `upsert(nodes, vectors)`：**全量对齐 + 清理陈旧主键**（删除集合中已不在当前知识库的 id）；节点数与向量数不一致直接报错，避免 `zip` 静默截断后连带误删
+- ⚠️ **Milvus 的写入与删除都要 `flush` 之后才能被 `query` 查到**。所以顺序必须是"先 flush 并取旧主键集合 → 再 upsert → 再 flush → 再 delete"，写反了陈旧主键清理会**静默失效**（已踩过，单测用带可见性延迟的假 client 卡住这个顺序）
+- `search(qv, top_k)` 返回 `[(kp_id, score)]`；`count()` 用于校验集合规模
 
 **`keyword_retriever.py`**：jieba 分词 + `BM25Okapi`；**索引语料 = 标题 + 正文 + 关键词字段**（概念增强后的关键词参与 BM25，使"加班费"等口语词命中法律条文）。`search(query, top_k)` 返回 `[(node, score)]`
 
-**`vector_retriever.py`**：bge-m3 编码 query，与预计算知识点向量点积（余弦），`search(query, top_k)`
+**`vector_retriever.py`**：bge-m3 编码 query → `store.search()` → 用 `kp_id → node` 映射回图谱节点；集合中残留当前图谱已不存在的 id 时跳过
 
 **`hybrid_retriever.py`**（核心，多跳）：
 - RRF 融合：`score = Σ 1/(60+rank)`，关键词与向量两路并集
 - `_bfs_expand()`：图谱**多跳扩展**——从种子节点沿边 BFS 最多 `expand_hops` 跳，分数 = 种子分 × 边权重 × `decay^hop`，逐跳剪枝，最终取前 `expand_k` 个
-- `search(query, top_k)` 返回 **top_k 种子 + 至多 expand_k 扩展 = 至多 8 块**（生成器全用）
-- **已知局限**：宽泛"措施/责任"类问题（如同时涉及两法多条文）扩展易被稀释，部分期望条文会落入扩展区甚至丢失（详见 §6 评估结果）。
+- `search(query, top_k)` 返回 **top_k 种子 + 至多 expand_k 扩展**（默认 10 + 5，最多 15 块，生成器全用）
+- **已知局限**：宽泛"措施/责任"类问题（如同时涉及多法多条文）扩展易被稀释，部分期望条文会落入扩展区甚至丢失（详见 §6 评估结果）。
 
 ### 5.4 生成（`app/generation/answer.py`）
 
 - `AnswerGenerator`：OpenAI 客户端指向 DashScope 兼容接口
 - `generate_stream()`：**流式**生成（`stream=True`，逐块 yield），`generate()` 聚合完整结果
-- **SYSTEM_PROMPT 为劳动法领域定制**："依据《中华人民共和国劳动法》《中华人民共和国劳动合同法》…涉及具体规定时点明法律依据（如"依据《劳动合同法》第五十八条"）…不要臆造法条…末尾列出全部引用"
-- `_format_contexts()`：每条 context 截断 600 字；**标题带法律名**（从 `source` 提取，如 `中华人民共和国劳动合同法·第四章·第八十五条`）——两部法律同章同条号，不带法律名会导致 LLM 张冠李戴
+- **SYSTEM_PROMPT 为民事法律领域定制**："依据《中华人民共和国民法典》《中华人民共和国劳动法》《中华人民共和国劳动合同法》…解答劳动权益、劳动合同…以及合同、物权、侵权责任、婚姻家庭、继承等民事法律问题…涉及具体规定时点明法律依据…不要臆造法条…末尾列出全部引用"
+- `_format_contexts()`：每条 context 截断 600 字；**标题带法律名**（从 `source` 提取，如 `中华人民共和国劳动合同法·第四章·第八十五条`）——多部法律同章同条号，不带法律名会导致 LLM 张冠李戴。民法典的标题还会自带编名（`中华人民共和国民法典·第七编 侵权责任·第十章·第一千二百五十四条`）
 
 ### 5.5 短期记忆（`app/memory/memory_store.py`）
 
@@ -204,7 +219,7 @@ llm_wiki_laws/
 
 ### 5.6 知识库加载（`app/kb.py`）
 
-- `KnowledgeBase.load()`：加载图谱 + 向量缓存 + 构建 HybridRetriever；无向量缓存时退化为仅关键词
+- `KnowledgeBase.load(embedder=None, store=None)`：加载图谱 + 连 Milvus + 构建 HybridRetriever；**Milvus 不可用**（服务未启动/集合不存在）时打印告警并退化为纯关键词检索，不抛异常。`store` 可注入供离线测试。
 - `search(query, top_k)` 统一检索入口
 
 ### 5.7 CLI（`app/cli.py`）
@@ -224,46 +239,49 @@ llm_wiki_laws/
 
 ## 6. 评估体系（`eval/`）
 
-**数据**：`eval/qa_test_cases.jsonl`，**30 条劳动法评估用例**：
+**数据**：`eval/qa_test_cases.jsonl`，**35 条劳动法评估用例**：
 - 字段：`id/type/question/answer/expected_knowledge/source_sections/sub_questions`
-- `type`：`single_hop`(10) / `multi_hop`(10) / `complex`(10，含子问题拆分)
+- `type`：`single_hop` / `multi_hop` / `complex`（含子问题拆分）
 - 覆盖：试用期、竞业限制、经济补偿、加班、非全日制、劳务派遣、经济性裁员、孕期女职工保护、劳动争议处理、劳动监察等
 - `answer` 作为 ragas `ground_truth`；`expected_knowledge`（知识点 id，与图谱 KP 编号对应）用于 recall@k 比对
-- **30 条用例的 KP id 均已在知识图谱中存在**（校验脚本：逐条比对无缺失、无重复）
+- **用例的 KP id 全部指向两部劳动法（最大 KP_196）**，而 `KP_001`–`KP_205` 的编号映射在新增民法典后**保持不变**（民法典排在 KP_206 之后），故历史 recall 基线仍可比
 
 **指标**：
-- 自定义 `eval/metrics.py::recall_at_k`：**recall@1/3/5/8**（@8 反映生成器真实上下文——检索返回 5 种子 + 3 扩展）
+- 自定义 `eval/metrics.py::recall_at_k`：**recall@1/3/5/8**（@8 是沿用历史基线的汇报口径，**不是生成器上下文上限**——生成器拿的是检索返回的全部块，默认 top_k=5 种子 + 至多 5 个扩展）
 - ragas 0.3.0：`context_precision`、`context_recall`、`ContextRelevance`、`answer_relevancy`、`faithfulness`
 
 **`eval/evaluate.py`** 流程：加载用例 → 检索+生成（tqdm 进度条）→ recall@k（1/3/5/8）→ ragas 指标 → 结果落盘 `eval/results/evaluation_<时间戳>.json`
+- 检索走 `KnowledgeBase.load()`，**即 Milvus**（Milvus 挂了会退化成纯关键词，recall 会明显下降——评估前先确认向量库在跑）
 - LLM：`LangchainLLMWrapper(ChatOpenAI(base_url=DashScope, model=qwen-max))`
 - Embeddings：**必须用 `langchain_community.embeddings.DashScopeEmbeddings`**（`text-embedding-v3`）经 `LangchainEmbeddingsWrapper` 包装。⚠️ 曾踩坑：`langchain_openai.OpenAIEmbeddings` 配 DashScope 会报 `input.contents is neither str nor list of str`。
-- 参数：`--limit N` 试跑、`--skip-ragas` 仅检索质量、`--top-k`、`--case-file`
+- 参数：`--limit N` 试跑、`--skip-ragas` 仅检索质量、`--top-k`（默认 5）、`--case-file`
 
-**当前实测结果**（2026-08-12，30 条，`--skip-ragas`）：
-- recall@1：**0.40**、recall@3：**0.69**、recall@5：**0.84**、recall@8：**0.92**
-- 单跳用例：10 条全部 recall@3=1.0（其中 7 条 recall@1=1.0）
+**当前实测结果**（2026-09-13，35 条，`--skip-ragas`，民法典入库后）：
+- recall@1：**0.431**、recall@3：**0.7119**、recall@5：**0.8405**、recall@8：**0.9262**
+- 与民法典入库前基线（0.40 / 0.69 / 0.84 / 0.92）持平或略升——两部劳动法的知识点编号未变，向量检索也从"只在前 205 节点里排序"恢复为全库 1465 节点
 - 多跳/复杂用例的依赖条文主要靠 **crossref 图谱扩展**带进上下文（46→38、65→39、42→45、41→46 等）
 - **已知薄弱**：宽泛的"措施/责任"类问题（eval_026 拖欠工资维权、eval_030 维权途径、eval_025 孕期违法解除）期望条文未必全部落入 top-8；生成器在缺失部分条文时仍能基于已召回的相关条文给出**合法合理**的答案（冒烟测试验证）
 
 ---
 
-## 7. 测试（`tests/`，42 项全过）
+## 7. 测试（`tests/`，67 项全过）
 
 | 文件 | 覆盖 |
 |---|---|
-| `test_knowledge_extract.py` | 清洗、章/节/条解析、康熙部首变体、交叉引用排除、表格回填、关键词、真实 md 提取（98/107 条） |
-| `test_concept_map.py` | 概念映射的文档感知匹配、关键词注入去重、未映射跳过 |
-| `test_graph_build.py` | sibling/keyword/semantic 三类边 + **crossref 交叉引用边**（FakeEmbedder） |
-| `test_retrieval.py` | BM25（含关键词字段）、向量、RRF 融合、图谱多跳扩展 |
+| `test_knowledge_extract.py` | 清洗、编/章/节/条解析、康熙部首变体、交叉引用排除、表格回填、关键词、**千位条号**、**编层级与同号章区分**、**分编边界**、**裸域名/斜杠日期噪音**、**`\f` 行号**、真实 md 提取（98/107/**1260** 条） |
+| `test_concept_map.py` | 概念映射的文档感知匹配、关键词注入去重、未映射跳过、**民法典概念（含千位条号）** |
+| `test_graph_build.py` | sibling/keyword/semantic 三类边 + **crossref 交叉引用边**（FakeEmbedder）+ **跨编同号章不建 sibling 边** + **千位条号 crossref** |
+| `test_milvus_store.py` | 集合 schema/索引、维度不符重建、全量对齐写入、**陈旧主键清理（含可见性延迟下的顺序回归）**、`(kp_id, score)` 返回、条数统计（假 client，离线） |
+| `test_kb.py` | Milvus 可用时启用向量检索、**不可用时退化为纯关键词且不抛异常** |
+| `test_retrieval.py` | BM25（含关键词字段）、向量（假 store）、RRF 融合、图谱多跳扩展 |
 | `test_memory.py` | SQLite 记忆读写、会话隔离、轮数限制 |
 | `test_generation.py` | 流式逐块、聚合、prompt 组装与多跳引导、**上下文标题带法律名**（mock LLM） |
 | `test_logger.py` | 日志 JSON 事件、缺失耗时兜底 |
 | `test_eval.py` | recall@k 指标、评估数据行组装（mock 检索/生成） |
 | `test_pipeline.py` | PDF 发现、增量转换、md 发现、多文档全局编号 |
-| `test_wiki_writer.py` | 概念导航链接渲染、跨文档条文消歧 |
+| `test_wiki_writer.py` | 概念导航链接渲染、跨文档条文消歧、**编→章 两级目录分组**、**章号数值排序** |
 
-测试策略：**不加载真实大模型/PDF**，用 `DummyEmbedder`/`FakeEmbedder`/mock 客户端。`test_knowledge_extract` 的 `test_real_markdown_extracts` 仅在 `data/raw` 有 md 时运行。
+测试策略：**不加载真实大模型/PDF、不连 Milvus、不调 LLM**，用各测试文件自带的假编码器（`StubEmbedder`/`FakeEmbedder`）、假向量库（`StubVectorStore`/`FakeMilvusClient`）与 mock 客户端。`test_knowledge_extract` 的 `test_real_markdown_extracts` 仅在 `data/raw` 有 md 时运行。
 
 ---
 
@@ -272,20 +290,21 @@ llm_wiki_laws/
 **构建**（`uv run python -m app.ingest.pipeline`）：
 ```
 data/src/*.pdf ──markitdown(增量)──► data/raw/*.md
-data/raw/*.md ──章/节/条切分──► KnowledgePoint[]（205，全局编号）
-  └─► concept_map 概念关键词增强
-  └─► bge-m3 语义向量（缓存 wiki/knowledge_vectors.npy）
-  └─► 关联图谱 knowledge_graph.json（sibling/keyword/semantic/crossref，2962 边）
-  └─► wiki/ 页面集（index 含核心概念导航）
+data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全局编号）
+  └─► concept_map 概念关键词增强（53 个概念）
+  └─► bge-m3 语义向量（只编码一次：既供语义边、也写 Milvus）
+  └─► 关联图谱 knowledge_graph.json（sibling/keyword/semantic/crossref，21252 边）
+  └─► Milvus 集合 llm_wiki_laws（全量对齐写入 + 清理陈旧主键）
+  └─► wiki/ 页面集（index 含核心概念导航；有"编"的法律按 编→章 两级）
 ```
 
 **问答**（`uv run python -m app.cli`）：
 ```
 用户query + 短期记忆注入
-  └─► BM25 关键词（含概念关键词）+ bge-m3 向量 双路召回
-  └─► RRF 融合 → Top-K 种子
-  └─► 图谱多跳扩展（≤3跳，衰减0.5，crossref 权重1.5）
-  └─► qwen-max 流式生成（法律领域 prompt + 法律名标题 + 引用）
+  └─► BM25 关键词（含概念关键词）+ bge-m3 向量（Milvus）双路召回
+  └─► RRF 融合 → Top-K 种子（默认 10）
+  └─► 图谱多跳扩展（≤3跳，衰减0.5，crossref 权重1.5，至多 5 个）
+  └─► qwen-max 流式生成（民事法律 prompt + 法律名标题 + 引用）
   └─► 写日志 logs/qa.log + 写记忆 memory.db
 ```
 
@@ -295,15 +314,20 @@ data/raw/*.md ──章/节/条切分──► KnowledgePoint[]（205，全局�
 
 1. **ragas/langchain 版本**：`ragas==0.3.0` + `langchain-community==0.4.0` + langchain 1.x 是唯一验证可行的组合。改版本必踩 `vertexai` 缺失或 `agenerate_prompt` 报错。
 2. **DashScope embedding**：评估用 `DashScopeEmbeddings`，不要用 langchain 的 `OpenAIEmbeddings`（格式不兼容）。
-3. **康熙部首变体**：法律 PDF 的"第⼀条"用 U+2F00 康熙部首，NFKC 归一前不匹配 `[一二三四五六七八九十百零]`；`_KANGXI_TABLE` 需在**匹配正则前**对原始行 translate，否则劳动法（107 条）会漏切。
 4. **交叉引用误切**：正文折行的"第三十九条和第四十条…"条后无空白，与真条文头"第X条　"区分；若交叉引用被误判为条文会重复编号。
-5. **中文数字含"零"**：`第一百零一条` 需要数字正则含"零"，否则漏掉 101-107 条。
-6. **多跳依赖条文召回**：靠 crossref 边（正文"第X条"引用）在图谱扩展阶段带出；概念映射关键词补"用户口语→法条"鸿沟。两者结合才使多跳用例 recall@8 达 0.92。
-7. **跨法同条号混淆**：两部法律同有 85/98 等条文号，生成上下文标题必须带法律名，否则 LLM 会张冠李戴（如把劳动法 98 引成劳动合同法 98）。
-8. **bge-m3 模型较大**（2.2GB），首次加载慢；向量已缓存，语义边用缓存加载。
-9. **知识库规模**：205 知识点 / 2962 边；语义阈值 0.75（0.65 会近全连接），keyword 0.3，crossref 权重 1.5。
-10. `.gitignore` 忽略：`data/`、`wiki/`、`knowledge_graph.json`、`logs/`、`memory.db`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。
-11. 项目已 `git init`（分支 dev_law，主分支 main）。CLAUDE.md 与 任务描述.md 虽被 gitignore 但仍在工作区。
+5. **中文数字必须含"零"和"千"**：`第一百零一条` 需含"零"，`第一千二百六十条` 需含"千"。**缺"千"让民法典只抽到 999/1260 条**（整整丢掉婚姻家庭编、继承编、侵权责任编等 261 条）。字符集集中在 `knowledge_extract.CN_NUM_CHARS`，`cn_to_int` / 交叉引用正则 / 关键词清洗正则都从它派生。
+6. **"编"必须参与分组**：民法典 7 编章号重新起算，`graph_build` 的 sibling 分组键与 `wiki_writer` 的目录分组都必须带 `part`，否则不同编的同号章会合并（曾产生 3.7 万对假边、全库边数虚高到 40992）。
+7. **章标题会变成垃圾知识点**：页眉噪音（如 `www.npc.gov.cn/...`、`8/23/2020`）若未被过滤，会被挂到"章"下，`flush()` 时生成 clause 为空的假知识点（曾 34 个）。`flush()` 要求 `clause` 非空可兜住这类问题。
+8. **`\f` 会让行号漂移**：源文件含换页符（民法典 130 处），`splitlines()` 把 `\f` 当换行，`source` 行号比编辑器实际大（末尾偏移 129 行，溯源失效）。必须按 `\n` 拆行、行内按 `\f` 分段并共用行号。
+9. **Milvus 写入/删除要 flush 才可见**：`upsert()`/`delete()` 后必须 `flush()`，`query()` 才能查到。所以"清理陈旧主键"必须**先取旧主键集合再写入**——写反了会读成空集、清理静默失效（已踩过，`test_milvus_store.py` 用带可见性延迟的假 client 卡住这个顺序）。
+10. **`.npy` 向量缓存是历史包袱**：它只按"文件是否存在"判断命中，民法典入库后图谱 1238 节点、缓存却还是 205 行，`VectorRetriever` 不报错、只是永远只在前 205 个节点里排序（**民法典的语义召回长期静默失效**）。现已改为 Milvus + 全量对齐，`Embedder.cache()` 删除。
+11. **`pymilvus` 版本**：必须 `>=2.5,<2.6`。2.4.x 在 Python 3.13 上 `import` 即失败（依赖已被移除的 `pkg_resources`）。2.5.x 客户端连 Milvus v2.4.4 服务端可用（已实测：写入 1465 条 + 建索引 + 检索正常）。
+12. **多跳依赖条文召回**：靠 crossref 边（正文"第X条"引用）在图谱扩展阶段带出；概念映射关键词补"用户口语→法条"鸿沟。两者结合才使多跳用例 recall@8 达 0.926。
+13. **多法同条号混淆**：多部法律同有 85/98 等条文号，生成上下文标题必须带法律名，否则 LLM 会张冠李戴；民法典标题还带编名。
+14. **bge-m3 模型较大**（2.2GB），首次加载慢；`graph_build` 编码一次后向量复用（语义边 + Milvus 写入库），不要再重复编码。
+15. **知识库规模**：1465 知识点 / 21252 边（sibling 15306 / semantic 11720 / keyword 3446 / crossref 97）；语义阈值 0.75（0.65 会近全连接），keyword 0.3，crossref 权重 1.5。
+16. `.gitignore` 忽略：`data/`、`knowledge_graph.json`、`logs/`、`memory.db`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。⚠️ **`wiki/` 已不再被忽略**，`wiki/concepts/` 下的页面与其 `.obsidian/`（Obsidian 本地配置）都会被提交，改动时注意别把编辑器状态一起带进去。
+17. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
 
 ---
 
@@ -313,16 +337,19 @@ data/raw/*.md ──章/节/条切分──► KnowledgePoint[]（205，全局�
 - **宽泛措施题**：eval_026/030 类"维权途径/责任"题，可考虑按预期条文补 crossref 或概念映射，或放宽生成上下文。
 - **实体链接 + 图传播**：从 query 抽实体 → 图谱节点 → 影响力传播召回。
 - **评估完善**：可增加"测试集抽样"、`--limit` 随机采样、结果对比历史版本。
-- **新增法律**：把新法律 PDF 放入 `data/src/` → 重跑 pipeline；如需其在概念导航出现，需在 `concept_map.py` 补映射。
-- **Web API**：用户偏好 CLI，如需前端需另行确认。
+- **新增法律**：把新法律 PDF 放入 `data/src/` → 重跑 pipeline；如需其在概念导航出现，需在 `concept_map.py` 补映射。若新法律也有"编/分编"层级或千位条号，先确认 `CN_NUM_CHARS`/`_PART_RE`/`_SUBPART_RE` 覆盖得住。
+- **MySQL 记忆迁移**：`docker-compose.yml` 里已有 mysql:8.0.43（宿主机 3308），短期记忆仍在 SQLite。
+- **多用户/并发/异步**、**意图识别与兜底回答**、**图数据库存图谱**：见 README「后续优化功能」。
 
 ---
 
 ## 11. 验收/继续开发检查清单
 
-- [ ] `uv run python -m pytest tests/ -v` → 42 passed
-- [ ] `uv run python -m app.ingest.pipeline` → 205 知识点 / 2962 关联边
-- [ ] `export API_KEY=... && uv run python -m app.cli` → 多轮问答正常
-- [ ] `uv run python -m eval.evaluate --skip-ragas` → recall@1/3/5/8 输出
-- [ ] 新增知识源：放 `data/src/*.pdf` 或 `data/raw/*.md` → 重跑 pipeline
+- [ ] Milvus 在跑：`docker ps` 见 `milvus-standalone`（宿主机端口 **19532**）
+- [ ] `uv run python -m pytest tests/ -v` → **67 passed**
+- [ ] `uv run python -m app.ingest.pipeline` → **1465 知识点 / 21252 关联边** + `向量已写入 Milvus 集合 llm_wiki_laws：1465 条`
+- [ ] Milvus 条数核对：`MilvusVectorStore().count()` → 1465
+- [ ] `export API_KEY=... && uv run python -m app.cli` → 多轮问答正常（含民法典问题，如"高空抛物致人损害谁担责"应命中第一千二百五十四条）
+- [ ] `uv run python -m eval.evaluate --skip-ragas` → recall@1≈0.43 / @3≈0.71 / @5≈0.84 / @8≈0.93
+- [ ] 新增知识源：放 `data/src/*.pdf` 或 `data/raw/*.md` → 重跑 pipeline（**必须重跑，向量库不会自己发现知识库变了**）
 - [ ] 新增法律概念导航：编辑 `app/ingest/concept_map.py` 补映射 → 重跑 pipeline
