@@ -155,6 +155,14 @@ class UserMemoryStore:
         return int(rows[0]["count(*)"]) if rows else 0
 
 
+def memory_summary(memories: list[dict]) -> dict:
+    """长期记忆召回摘要（只记条数与类型，**不含正文**），供日志使用。"""
+    from collections import Counter
+
+    return {"count": len(memories),
+            "kinds": dict(Counter(m.get("kind", "unknown") for m in memories))}
+
+
 def build_summary(question: str, answer: str, max_chars: int = MEMORY_SUMMARY_CHARS) -> str:
     """把一轮问答压成一条记忆文本（不调 LLM，零成本）。"""
     question = (question or "").strip()

@@ -19,7 +19,6 @@ env/
 ENV/
 
 # ===== 运行时 / 知识库构建产物（可重新生成） =====
-knowledge_graph.json
 logs/
 memory.db
 eval/results/
@@ -53,7 +52,6 @@ Thumbs.db
 任务描述.md
 docs/法律问答系统(llm-wiki)
 wiki/concepts/.obsidian
-wiki/
 
 # ===== Docker 运行时数据（容器写出的库数据，不入库） =====
 docker/mysql_data/

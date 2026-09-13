@@ -1,9 +1,10 @@
 """评估主程序：遍历测试用例，运行检索+生成，计算 recall@k 与 ragas 指标。
 
 用法：
-    uv run python -m eval.evaluate                     # 全量评估（30条，较慢）
+    uv run python -m eval.evaluate                     # 全量评估（55 条：劳动法/劳动合同法 35 + 民法典 20）
     uv run python -m eval.evaluate --limit 3           # 快速试跑 3 条
     uv run python -m eval.evaluate --skip-ragas        # 仅计算 recall@k，不跑 ragas
+    uv run python -m eval.evaluate --skip-ragas --source 民法典   # 只看某部法律的用例
 
 指标映射（ragas 0.2.x）：
     recall@k            → 自定义，见 eval/metrics.py
@@ -93,7 +94,8 @@ def build_rows(
             "reference": case["answer"],
             "gen_ok": gen_ok,
         })
-        detail = {"id": case["id"], "type": case["type"], **recall}
+        detail = {"id": case["id"], "type": case["type"],
+                  "source": case.get("source", []), **recall}
         if intent is not None:
             detail["intent"] = intent
         recalls.append(detail)
@@ -201,12 +203,17 @@ def main() -> None:
     parser.add_argument("--case-file", default=str(CASES_PATH), help="用例文件")
     parser.add_argument("--intent", action="store_true",
                         help="额外跑意图分类并统计误判率（不改变 recall 口径）")
+    parser.add_argument("--source", default=None,
+                        help="只评估指定来源法律的用例（如 民法典 / 劳动法 / 劳动合同法）")
     args = parser.parse_args()
 
     cases = load_cases(Path(args.case_file))
+    if args.source:
+        cases = [c for c in cases if args.source in (c.get("source") or [])]
     if args.limit:
         cases = cases[: args.limit]
-    print(f"[eval] 加载 {len(cases)} 条用例")
+    print(f"[eval] 加载 {len(cases)} 条用例"
+          + (f"（来源过滤：{args.source}）" if args.source else ""))
 
     print("[eval] 加载知识库…")
     kb = KnowledgeBase.load()
@@ -247,6 +254,22 @@ def main() -> None:
     for k, v in recall_summary.items():
         if k.startswith("recall@"):
             print(f"  {k}: avg={v['avg']} (n={v['n']})")
+
+    # ---- 按来源法律分组（看出某部法律/某个新库的检索质量）----
+    ks = ("recall@1", "recall@3", "recall@5", "recall@8")
+    laws = sorted({law for r in recalls for law in (r.get("source") or [])})
+    by_source: dict = {}
+    if len(laws) > 1:
+        print("\n===== 按来源法律 =====")
+        for law in laws:
+            subset = [r for r in recalls if law in (r.get("source") or [])]
+            entry = {"n": len(subset)}
+            for k in ks:
+                vals = [r[k] for r in subset if r[k] is not None]
+                entry[k] = round(sum(vals) / len(vals), 4) if vals else None
+            by_source[law] = entry
+            print(f"  {law:8} n={entry['n']:3}  " +
+                  "  ".join(f"{k}={entry[k]}" for k in ks))
 
     # ---- ragas 指标 ----
     ragas_result = None

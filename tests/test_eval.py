@@ -37,6 +37,51 @@ class FakeGen:
         return "系统生成的参考答案"
 
 
+def test_case_file_carries_source_law():
+    """用例要能标明来源法律，便于按法律分组看检索质量。"""
+    cases = load_cases()
+    assert all(c.get("source") for c in cases), "有用例缺 source 字段"
+    laws = {law for c in cases for law in c["source"]}
+    assert {"民法典", "劳动法", "劳动合同法"} <= laws
+    assert sum(1 for c in cases if "民法典" in c["source"]) >= 20
+
+
+def test_recall_detail_keeps_source():
+    """recall 明细要带上 source —— 否则评估结果无法按来源法律分组。"""
+    cases = load_cases()
+    _, recalls = build_rows(cases[:3], FakeKB(), FakeGen(), top_k=5)
+    assert all("source" in r and r["source"] for r in recalls)
+    assert recalls[0]["source"] == cases[0]["source"]
+
+
+def test_civil_code_crossref_cases_include_referenced_articles():
+    """引用关系型用例必须同时期望"引用方"与"被引方"，否则无法验证引用链是否被带进上下文。"""
+    import json
+    import re
+    from pathlib import Path
+
+    graph = json.loads(Path("knowledge_graph.json").read_text(encoding="utf-8"))
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    cases = load_cases()
+    multi = [c for c in cases if "民法典" in c["source"] and len(c["expected_knowledge"]) > 1]
+    assert len(multi) >= 10, f"民法典多跳用例偏少：{len(multi)}"
+
+    def article(kp):
+        return re.search(r"第[一二三四五六七八九十百千零]+条$", nodes[kp]["clause"]).group(0)
+
+    verified = 0
+    for case in multi:
+        for src in case["expected_knowledge"]:
+            if not re.search(r"第[一二三四五六七八九十百千零]+条$", nodes[src]["clause"]):
+                continue
+            for tgt in case["expected_knowledge"]:
+                if src == tgt:
+                    continue
+                if article(tgt) in nodes[src]["content"]:
+                    verified += 1
+    assert verified >= 12, f"引用关系覆盖过少：{verified}"
+
+
 def test_build_rows_with_gen():
     cases = load_cases()
     rows, recalls = build_rows(cases[:3], FakeKB(), FakeGen(), top_k=5)

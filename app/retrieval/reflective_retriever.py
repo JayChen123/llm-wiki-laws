@@ -56,7 +56,8 @@ class ReflectiveRetriever:
         self.max_rounds = max_rounds
         # 引用关系与图谱 crossref 边同源（crossref_map），避免两处规则不一致
         self.crossrefs = crossrefs if crossrefs is not None else crossref_map(nodes)
-        self.last_trace: dict = {"rounds": 0, "reasons": []}
+        self.last_trace: dict = {"mode": "reflect", "seeds": [], "expanded": [],
+                                 "fetched": [], "rounds": 0, "reasons": []}
 
     def _candidate_ids(self, collected: list[dict], seen: set[str]) -> list[str]:
         """本轮候选被引条文：已收集条文引用过、且尚未在上下文中的条文（保序去重）。"""
@@ -67,6 +68,11 @@ class ReflectiveRetriever:
                     candidates.append(target)
         return candidates
 
+    def _brief(self, node_id: str, round_no: int) -> dict:
+        """日志用的节点摘要：只记 id/标题/分数（+第几轮补取），不记正文。"""
+        node = self.id2node.get(node_id, {})
+        return {"id": node_id, "title": node.get("title", ""), "round": round_no}
+
     def search(self, query: str, top_k: int = TOP_K) -> list[dict]:
         # 基础上下文 = 与 bfs 模式完全相同的"种子 + 图谱扩展"（含 crossref 边），
         # 保证 reflect 的上下文是 bfs 的超集，不会因换链路丢掉 sibling/semantic 补充
@@ -74,6 +80,7 @@ class ReflectiveRetriever:
         seen: set[str] = {r["id"] for r in collected}
         scores: dict[str, float] = {r["id"]: r.get("score", 0.0) for r in collected}
         reasons: list[str] = []
+        fetched_brief: list[dict] = []      # 反思补取的条文（日志用）
         rounds = 0
 
         while rounds < self.max_rounds:
@@ -91,6 +98,7 @@ class ReflectiveRetriever:
                 reasons.append("反思要取的条文均已在上下文中，停止")
                 break
             for cid in fetched:
+                fetched_brief.append(self._brief(cid, rounds + 1))
                 parent = next(
                     (item for item in collected if cid in self.crossrefs.get(item["id"], [])),
                     None,
@@ -104,5 +112,14 @@ class ReflectiveRetriever:
                 scores[cid] = score
             rounds += 1
 
-        self.last_trace = {"rounds": rounds, "reasons": reasons[:4]}
+        # seeds / expanded 来自基础扩展那一步（hybrid 记录的），fetched 是反思补取的
+        base_trace = getattr(self.hybrid, "last_trace", None) or {}
+        self.last_trace = {
+            "mode": "reflect",
+            "seeds": base_trace.get("seeds", []),
+            "expanded": base_trace.get("expanded", []),
+            "fetched": fetched_brief,
+            "rounds": rounds,
+            "reasons": reasons[:4],
+        }
         return collected

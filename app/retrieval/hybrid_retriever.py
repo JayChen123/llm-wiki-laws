@@ -48,16 +48,19 @@ class HybridRetriever:
             hops: int,
             per_hop_k: int,
             decay: float,
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float], dict[str, int]]:
         """从种子节点沿关联边 BFS 扩展多跳候选。
 
         节点分数 = 上层种子分数 × 边权重 × decay^hop；每跳只保留 Top
         per_hop_k 个候选，避免遍历爆炸。
+
+        返回 `(分数, 跳数)`：跳数用于日志里说明"这条扩展是从第几跳带进来的"。
         """
         adj = self._adjacency_map()
         visited = set(seeds)
         frontier = [(nid, seed_scores[nid]) for nid in seeds]
         expanded: dict[str, float] = {}
+        hops_of: dict[str, int] = {}
         for hop in range(1, hops + 1):
             candidates: dict[str, float] = {}
             for nid, score in frontier:
@@ -73,9 +76,18 @@ class HybridRetriever:
             frontier = []
             for nb, s in top:
                 expanded[nb] = s
+                hops_of[nb] = hop
                 visited.add(nb)
                 frontier.append((nb, s))
-        return expanded
+        return expanded, hops_of
+
+    def _brief(self, node_id: str, score: float, hop: int | None = None) -> dict:
+        """日志用的节点摘要：只记 id/标题/分数（+跳数），不记正文。"""
+        node = self.id2node.get(node_id, {})
+        brief = {"id": node_id, "title": node.get("title", ""), "score": round(float(score), 4)}
+        if hop is not None:
+            brief["hop"] = hop
+        return brief
 
     def search(self, query: str, top_k: int = 5, expand: bool = True) -> list[dict]:
         """返回 [ {id,title,chapter,content,score,source} ]，已排序。
@@ -101,15 +113,23 @@ class HybridRetriever:
 
         # 图谱多跳扩展：从命中种子沿关联边 BFS 最多 N 跳，分数逐跳衰减
         if expand:
-            expanded_scores = self._bfs_expand(
+            expanded_scores, expanded_hops = self._bfs_expand(
                 ranked_ids, base, self.expand_hops, self.expand_k, self.expand_decay
             )
             extra_ids = sorted(expanded_scores, key=lambda k: -expanded_scores[k])[
                 : self.expand_k
             ]
         else:
-            expanded_scores = {}
+            expanded_scores, expanded_hops = {}, {}
             extra_ids = []
+
+        # 记录本次检索的构成，供日志区分"检索命中"与"图谱扩展带进来的"知识点
+        self.last_trace = {
+            "mode": "bfs" if expand else "seeds_only",
+            "seeds": [self._brief(nid, base.get(nid, 0.0)) for nid in ranked_ids],
+            "expanded": [self._brief(nid, expanded_scores.get(nid, 0.0), expanded_hops.get(nid))
+                         for nid in extra_ids],
+        }
 
         ordered = ranked_ids + extra_ids
         results = []

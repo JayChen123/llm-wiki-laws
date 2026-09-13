@@ -1,7 +1,8 @@
 """知识库加载与统一检索入口。"""
 from __future__ import annotations
 
-from app.config import REFLECT_MAX_ROUNDS, RETRIEVAL_MODE
+from app.config import (EXPAND_DECAY, EXPAND_HOPS, EXPAND_K,
+                        REFLECT_MAX_ROUNDS, RETRIEVAL_MODE)
 from app.ingest.graph_store import Neo4jGraphStore
 from app.retrieval.embedder import Embedder
 from app.retrieval.hybrid_retriever import HybridRetriever
@@ -61,7 +62,10 @@ class KnowledgeBase:
             vec = VectorRetriever(nodes, store, embedder)
         except Exception as exc:   # 向量库不可用则退化为纯关键词检索
             print(f"[kb] Milvus 向量库不可用（{exc}），退化为纯关键词检索")
-        hybrid = HybridRetriever(nodes, graph, kw, vec)
+        # 必须显式传入扩展参数：构造函数有默认值（expand_k=3），不传会让 config 里的
+        # EXPAND_K 静默失效——曾因此长期实际按 3 扩展，而配置与文档都写着 5。
+        hybrid = HybridRetriever(nodes, graph, kw, vec, expand_k=EXPAND_K,
+                                 expand_hops=EXPAND_HOPS, expand_decay=EXPAND_DECAY)
         retriever = hybrid
         if RETRIEVAL_MODE == "reflect":
             try:

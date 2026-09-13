@@ -89,7 +89,7 @@
 │   → Σ 1/(60+rank) 融合排序 → Top-K = 10 个种子                                     │
 │        │                                                                           │
 │        ▼                                                                           │
-│基础图谱扩展（≤3 跳，四类边，补 EXPAND_K=5）                                        │
+│基础图谱扩展（≤3 跳，四类边，每跳预算 EXPAND_K=5）                                   │
 │   └─► 反思循环（≤3 轮）：候选 = 被引条文白名单                                     │
 │         无引用关系 → 不调 LLM 直接停；有则判「已充分 / 该补哪几条」；失败即停      │
 │        │                                                                           │
@@ -195,7 +195,7 @@ llm_wiki_laws/
 │   ├── metrics.py                #   recall@1/3/5/8 检索指标（自定义）
 │   ├── evaluate.py               #   评估主程序（recall@k + ragas）
 │   └── results/                  #   评估结果输出
-├── tests/                        # 单元测试（pytest，185 项）
+├── tests/                        # 单元测试（pytest，201 项）
 └── README.md
 ```
 
@@ -272,22 +272,56 @@ llm_wiki_laws/
 
 ## 七、问答日志
 
-每次问答会写入一条 JSON 事件到 `logs/qa.log`（`RotatingFileHandler`，单文件 5MB、滚动保留 5 份），字段：
+每次问答写入一条 JSON 事件到 `logs/qa.log`（`RotatingFileHandler`，单文件 5MB、滚动保留 5 份）。
+**字段按需出现**（未检索/未启用记忆时不写），便于 grep 与统计：
 
-| 字段                               | 含义                                               |
-|----------------------------------|--------------------------------------------------|
-| `time`                           | 事件时间                                             |
-| `user_id`                        | 会话 ID（CLI 输入的会话标识）                               |
-| `query`                          | 用户问题                                             |
-| `knowledge_blocks`               | 本次检索命中的知识块列表（`id`/`title`/`score`/`source`，不含正文） |
-| `answer`                         | 最终回答（含引用）                                        |
-| `retrieval_ms` / `generation_ms` | 检索 / 生成耗时（毫秒）                                    |
+| 字段 | 含义 |
+|---|---|
+| `time` / `user_id` / `query` | 时间 / 会话（用户）标识 / **用户问题** |
+| `answer` | **最终回答**（含引用） |
+| `mode` | 检索链路：`reflect`（默认）/ `bfs` |
+| `seeds` | **检索命中**的知识点（RRF 融合后的种子，含 id/标题/分数） |
+| `graph_expanded` | **图谱扩展**带进来的知识点（含 id/标题/分数/**hop 跳数**） |
+| `reflect_fetched` | **反思循环沿引用关系补取**的条文（含 id/标题/**第几轮**） |
+| `reflect` | 反思轨迹 `{rounds, reasons}`，用于审计"为什么停在第几轮" |
+| `intent` / `intent_reason` | 意图分类结果与理由（兜底路径也能看出为什么没检索） |
+| `memory_recalled` | 长期记忆召回情况（`{count, kinds}`，**不含正文**） |
+| `knowledge_blocks` | 本次送进生成的**全部**知识块（`id`/`title`/`score`/`source`，不含正文） |
+| `retrieval_ms` / `generation_ms` | 检索 / 生成耗时（毫秒） |
 
-日志每行为一条 JSON，可用 `grep` / `jq` 直接检索分析：
+> 三类来源分开记，是为了排查"**某个法条为什么没进上下文**"：
+> `seeds` 没命中 → 检索问题；`graph_expanded` 没带出 → 边/权重问题；
+> `reflect_fetched` 为空且理由是"无可跟进的引用关系" → 正常的零成本停止。
+
+日志每行为一条 JSON，可直接用 `grep` / `jq` 分析：
+
+### 日志画像分析
 
 ```bash
-grep -o '"query": "[^"]*"' logs/qa.log        # 所有用户问题
-grep '"user_id": "user001"' logs/qa.log        # 某用户的问答记录
+uv run python -m scripts.analyze_logs                    # 汇总：意图分流/检索链路/上下文构成/反思/成本/耗时
+uv run python -m scripts.analyze_logs --tail 200         # 只看最近 200 条
+uv run python -m scripts.analyze_logs --since 2026-09-13 # 只看某时间之后
+uv run python -m scripts.analyze_logs --exclude-user alice  # 排除某账号（如测试账号）
+uv run python -m scripts.analyze_logs --json             # 机器可读
+```
+
+它回答的是"**反思值不值那次 LLM 调用**""意图分流了多少""检索与扩展各带进来多少"这类问题——
+靠单条日志看不出结论。输出示例（节选）：
+
+```
+【上下文构成】   命中 seeds   平均 10.0    图谱扩展   平均 3.0    最终上下文块  平均 10.67
+【反思】  停止原因 no_candidates 10.9% / llm_stop 30.4% / no_trace 47.8%
+          实际补取到条文的事件：0/2（0.0%）
+【LLM 调用成本（估算）】  反思调用/次 平均 0.33   总调用/次 平均 1.76
+```
+
+### 直接 grep 日志
+
+```bash
+grep -o '"query": "[^"]*"' logs/qa.log                 # 所有用户问题
+grep '"user_id": "user001"' logs/qa.log                # 某会话的问答记录
+jq -r 'select(.mode=="reflect") | .reflect_fetched[].id' logs/qa.log   # 反思实际补取了哪些条文
+jq -r 'select(.graph_expanded) | .query, (.graph_expanded[] | .id + " hop=" + (.hop|tostring))' logs/qa.log
 ```
 
 ---
@@ -413,7 +447,7 @@ uv run python -m pytest tests/ -v
 
 ## 十、测试
 
-`tests/`（**185 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
+`tests/`（**201 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
 
 | 测试文件                        | 覆盖范围                                                              |
 |-----------------------------|-------------------------------------------------------------------|
@@ -422,6 +456,7 @@ uv run python -m pytest tests/ -v
 | `test_knowledge_extract.py` | 清洗、编/章/节/条解析、千位条号、编层级与同号章区分、分编边界、噪音过滤、`\f` 行号、康熙部首变体、表格回填、关键词 |
 | `test_concept_map.py`       | 概念映射文档感知匹配、关键词注入去重、民法典概念（含千位条号）                                   |
 | `test_graph_build.py`       | sibling/keyword/semantic/crossref 四类边、跨编同号章不建边、千位条号 crossref   |
+| `test_graph_store.py`       | Neo4j 图存储：Cypher 与参数、全量对齐、四类关系拆分、引用方向派生、节点对归一化（假 driver，离线） |
 | `test_milvus_store.py`      | 集合 schema/索引、维度不符重建、全量对齐写入、陈旧主键清理、检索返回（假 client，离线）               |
 | `test_kb.py`                | Milvus 可用时启用向量检索、不可用时退化为纯关键词                                     |
 | `test_retrieval.py`         | BM25（含关键词字段）、向量检索、RRF 融合与图谱多跳扩展                                   |
@@ -433,6 +468,7 @@ uv run python -m pytest tests/ -v
 | `test_api_sessions.py`      | 会话 CRUD、**越权访问一律 404**（读/删/提问都不放行）、删除会话连带清长期记忆 |
 | `test_api_chat.py`          | SSE 事件流、意图兜底跳过检索、生成失败仍返回引用、**引用随历史持久化**、串题注入策略 |
 | `test_generation.py`        | 流式逐块输出、聚合、prompt 组装、上下文标题带法律名（mock LLM）                           |
+| `test_analyze_logs.py`       | 日志画像：解析容错（坏行/缺字段）、停止原因归类（含"未知归 other"）、成本估算、用户过滤 |
 | `test_logger.py`            | 日志 JSON 事件字段完整性、缺失耗时兜底                                            |
 | `test_eval.py`              | recall@k 指标、评估数据行组装（mock 检索/生成）                                   |
 | `test_wiki_writer.py`       | 概念导航链接渲染、跨文档条文消歧、编→章 两级目录分组、章号数值排序                                |
@@ -445,15 +481,16 @@ uv run python -m pytest tests/ -v
 
 ### 评估数据
 
-`eval/qa_test_cases.jsonl`，**35 条劳动法**测试用例（试用期、竞业限制、经济补偿、加班、劳务派遣、裁员、孕期保护、劳动争议等），JSONL
+`eval/qa_test_cases.jsonl`，**55 条**测试用例：劳动法与劳动合同法 35 条（试用期、竞业限制、经济补偿、加班、劳务派遣、裁员、孕期保护、劳动争议等）+ **民法典 20 条**（诉讼时效、离婚冷静期、高空抛物、继承顺序、夫妻财产与债务、自甘风险、收养等）。JSONL
 每行一个对象：
 
 | 字段                   | 含义                                                   |
 |----------------------|------------------------------------------------------|
 | `id` / `type`        | 用例编号 / 类型（`single_hop`·`multi_hop`·`complex`）        |
+| `source`             | **来源法律**（`民法典` / `劳动法` / `劳动合同法`；跨法用例为多项），用于按法律分组看检索质量 |
 | `question`           | 用户问题                                                 |
 | `answer`             | 标准答案（作为 ragas 的 `ground_truth`）                      |
-| `expected_knowledge` | 期望命中的知识点 id（用于 recall@k 比对）                          |
+| `expected_knowledge` | 期望命中的知识点 id（用于 recall@k 比对）。**引用关系型用例会同时列出"引用方"与"被引方"**，这样 recall@k 直接量化"引用链有没有被带进上下文" |
 | `source_sections`    | 答案来源章节                                               |
 | `sub_questions`      | 复杂问题的子问题拆分（complex 类型）                               |
 
@@ -471,9 +508,10 @@ uv run python -m pytest tests/ -v
 ### 运行评估
 
 ```bash
-uv run python -m eval.evaluate                 # 全量 35 条（生成+ragas，较慢）
+uv run python -m eval.evaluate                 # 全量 55 条（生成+ragas，较慢）
 uv run python -m eval.evaluate --limit 3       # 快速试跑前 3 条
 uv run python -m eval.evaluate --skip-ragas    # 仅计算 recall@k（不调 LLM）
+uv run python -m eval.evaluate --skip-ragas --source 民法典   # 只看某部法律的用例
 ```
 
 - **评估前先确认 Milvus 在跑**：检索走 `KnowledgeBase.load()`，Milvus 挂了会退化为纯关键词，recall 会明显下降。
@@ -481,8 +519,18 @@ uv run python -m eval.evaluate --skip-ragas    # 仅计算 recall@k（不调 LLM
   `langchain_community.embeddings.DashScopeEmbeddings`）。
 - 结果写入 `eval/results/evaluation_<时间戳>.json`，含 recall@k 汇总、ragas 各指标均值/最值/按类型分组、以及每用例明细。
 
-**当前基线**（2026-09-13，35 条，`--skip-ragas`）：recall@1=**0.431**、recall@3=**0.712**、recall@5=**0.841**、recall@8=**0.926**。
-（民法典入库前为 0.40 / 0.69 / 0.84 / 0.92；用例 `expected_knowledge` 全部指向两部劳动法，其知识点编号未变，故基线可比。）
+**当前基线**（2026-09-13，55 条，`--skip-ragas`）：recall@1=**0.489**、recall@3=**0.729**、recall@5=**0.859**、recall@8=**0.947**。
+
+按来源法律分组（评估会一并打印）：
+
+| 来源 | 条数 | recall@1 | recall@3 | recall@5 | recall@8 |
+|---|---|---|---|---|---|
+| 民法典 | 20 | **0.592** | 0.758 | 0.892 | **0.983** |
+| 劳动合同法 | 26 | 0.414 | 0.692 | 0.846 | 0.949 |
+| 劳动法 | 10 | 0.433 | 0.692 | 0.742 | 0.775 |
+
+> 两部劳动法 35 条的基线（0.431 / 0.712 / 0.841 / 0.926）未变，可与历史结果直接对比；
+> 民法典 20 条 @8=0.983 说明**多跳用例里的被引条文基本都进了上下文**（用例期望同时含引用方与被引方）。
 
 ---
 

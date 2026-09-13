@@ -112,6 +112,35 @@ def test_hybrid_rrf_and_expansion():
     assert all("content" in r for r in results)
 
 
+def test_hybrid_trace_separates_seeds_and_graph_expansion():
+    """last_trace 要分开记"检索命中"与"图谱扩展带进来的"，并带扩展跳数（供日志排查）。"""
+    nodes = _nodes()
+    emb = StubEmbedder()
+    vecs = emb.encode([n["title"] + n["content"] for n in nodes])
+    hr = HybridRetriever(nodes, _graph(), KeywordRetriever(nodes),
+                         _vector_retriever(nodes, vecs, emb), expand_k=2)
+
+    results = hr.search("请假流程", top_k=1)
+    trace = hr.last_trace
+
+    assert trace["mode"] == "bfs"
+    assert [n["id"] for n in trace["seeds"]] == ["KP_001"]          # RRF 种子
+    assert set(trace["seeds"][0]) == {"id", "title", "score"}       # 不含正文，日志不膨胀
+    expanded_ids = [n["id"] for n in trace["expanded"]]
+    assert "KP_003" in expanded_ids                                 # 经 sibling 扩展进来
+    assert all("hop" in n for n in trace["expanded"])               # 扩展节点带跳数
+    # 种子 + 扩展 = 实际返回结果
+    assert set(expanded_ids) | {"KP_001"} == {r["id"] for r in results}
+
+
+def test_hybrid_trace_marks_seeds_only_mode():
+    """expand=False 时（反思链路内部调用）mode 标明只要种子，expanded 为空。"""
+    hr = HybridRetriever(_nodes(), _graph(), KeywordRetriever(_nodes()), None)
+    hr.search("请假", top_k=2, expand=False)
+    assert hr.last_trace["mode"] == "seeds_only"
+    assert hr.last_trace["expanded"] == []
+
+
 def _chain_nodes():
     """链式图：A-B-C 依次相连（C 是 A 的二跳邻居），D 无关联。"""
     return [

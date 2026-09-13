@@ -19,7 +19,7 @@ from app.generation.intent import Intent, IntentClassifier, fallback_answer
 from app.kb import KnowledgeBase
 from app.logger import get_logger, log_qa_event
 from app.memory import build_search_query, create_memory_store
-from app.memory.long_term import LongTermMemory, UserMemoryStore
+from app.memory.long_term import LongTermMemory, UserMemoryStore, memory_summary
 from app.memory.profile_extractor import ProfileExtractor
 
 
@@ -104,6 +104,7 @@ def main() -> None:
                 knowledge_blocks=[],
                 answer=answer,
                 intent=intent_result.intent.value,
+                intent_reason=intent_result.reason,
                 logger=logger,
             )
             store.add(session, "user", q, user_id=user_id)
@@ -149,7 +150,9 @@ def main() -> None:
             retrieval_ms=retrieval_ms,
             generation_ms=generation_ms,
             intent=intent_result.intent.value if intent_result else None,
-            reflect=kb.last_trace,
+            intent_reason=intent_result.reason if intent_result else None,
+            trace=kb.last_trace,
+            memory=memory_summary(memories),
             logger=logger,
         )
 

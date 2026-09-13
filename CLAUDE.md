@@ -24,13 +24,14 @@ uv sync                                             # 安装/还原依赖（含 
 uv run python -m app.ingest.pipeline                # 构建知识库：全量重建图谱+wiki，并同步 Neo4j（幂等）
 uv run python -m app.ingest.sync_graph              # 只把 knowledge_graph.json 同步到 Neo4j（--check-only 只比对）
 uv run python -m app.cli                            # 命令行问答（需 export API_KEY 才有 LLM 生成，否则仅展示检索）
-uv run python -m pytest tests/ -v                   # 全部单元测试（当前 185 项）
+uv run python -m pytest tests/ -v                   # 全部单元测试（当前 201 项）
 uv run python -m pytest tests/test_retrieval.py -v  # 跑单个测试文件
 uv run python -m pytest tests/ -k "rrf or bfs" -v   # 按名称过滤
 uv run python -m eval.evaluate --limit 3            # 评估试跑 3 条
 uv run python -m eval.evaluate --skip-ragas         # 仅 recall@k（不调 LLM）
 cd web && npm run build && cd ..                    # 构建前端（产物由 FastAPI 托管）
 uv run python -m app.api.main                       # 启动 Web 服务（默认 :8080）
+uv run python -m scripts.analyze_logs                # 汇总问答日志画像（意图/检索/反思/成本/耗时）
 ```
 
 **测试全部离线**：各测试文件自带假编码器（`tests/test_retrieval.py` 的 `StubEmbedder`、`tests/test_graph_build.py` 的 `FakeEmbedder`）与假向量库（`StubVectorStore`、`tests/test_milvus_store.py` 的 `FakeMilvusClient`）、mock LLM，不加载真实 bge-m3、不连 Milvus、不调 DashScope。只有 eval 与 CLI 生成才需要真实模型和 `API_KEY`。
@@ -43,7 +44,7 @@ uv run python -m app.api.main                       # 启动 Web 服务（默认
 1. `keyword_retriever`：jieba 分词 + BM25Okapi，索引含标题/正文/**概念增强后关键词**（口语词可命中法条）；
 2. `vector_retriever`：bge-m3 编码 query → **Milvus**（`app/retrieval/vector_store.py`）余弦检索 → `kp_id` 映射回图谱节点；Milvus 不可用时混合器退化为纯关键词（**不再有 `.npy` 文件缓存**）；
 3. RRF 融合 `Σ 1/(60+rank)` 取 Top-K（默认 10）；
-4. 沿关联图 BFS ≤3 跳扩展（分数 = 种子 × 边权重 × 0.5^hop，每跳剪枝）补 EXPAND_K=5；
+4. 沿关联图 BFS ≤3 跳扩展（分数 = 种子 × 边权重 × 0.5^hop，**每跳预算也是 EXPAND_K**）补 EXPAND_K 个；
    `RETRIEVAL_MODE=reflect`（默认）时，在此基础上再由 **LLM 反思**决定是否沿**引用关系**继续补取
    （`retrieval/reflector.py` + `reflective_retriever.py`）：无引用关系则**不调 LLM 直接停**；
    候选是白名单编号（防幻觉）；`sufficient`/无候选/达 `REFLECT_MAX_ROUNDS`/要取的已在上下文 → 停；
@@ -84,7 +85,8 @@ crossref 是让"46条引38条/65条引39条"等被引用条文稳定进入生成
 - Milvus 向量库：`MILVUS_HOST`/`MILVUS_PORT`（默认 **19532**，是宿主机映射端口，容器内为 19530）/`MILVUS_COLLECTION`/`MILVUS_METRIC=COSINE`/`MILVUS_INDEX=HNSW`/`EMBED_DIM=1024`，均可用环境变量覆盖。
 - 意图识别：`INTENT_ENABLED`（默认开）、`INTENT_MODEL`（默认 `qwen-turbo`，分类要快）、`INTENT_TIMEOUT_S`（默认 3，**超时即保守放行**）。
 - 多跳链路：`RETRIEVAL_MODE`（`reflect` 默认 / `bfs` 对照）、`REFLECT_MODEL`（`qwen-turbo`）、`REFLECT_MAX_ROUNDS`（3）、`REFLECT_TIMEOUT_S`（15）。
-- 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（生成上下文最多 15 块）。
+- 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（**均可环境变量覆盖**）。
+  生成上下文 = TOP_K 种子（10）+ ≤EXPAND_K 扩展（5）**+ 反思补取**（每轮可多条）→ 15 起，实测见过 17。
 
 数据新增/更换：把 PDF 放 `data/src/` 或 md 直接放 `data/raw/` 后重跑 pipeline 即自动并入（含同步 Neo4j 与 Milvus）（PDF→MD 增量、知识点合并重编号、图谱与 Wiki 全量重建、**向量全量重写 Milvus 并清理陈旧主键**）。想让概念出现在"核心概念导航"（`wiki/index.md`），需在 `ingest/concept_map.py` 补映射；Wiki 页面落盘在 `ingest/wiki_writer.py`。**改知识源后必须重跑 pipeline**——向量库不会自己发现知识库变了（旧 `.npy` 缓存曾因此静默残留 205 行对着 1238 节点）。
 

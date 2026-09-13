@@ -46,9 +46,11 @@ uv run python -m app.ingest.pipeline     # 构建知识库（全量重建，幂�
 uv run python -m app.cli                 # 启动命令行问答
 cd web && npm run build && cd ..         # 构建前端（产物 web/dist，由 FastAPI 托管）
 uv run python -m app.api.main            # 启动 Web 服务（http://localhost:8080）
-uv run python -m pytest tests/ -v        # 运行全部测试（当前 185 项）
+uv run python -m pytest tests/ -v        # 运行全部测试（当前 201 项）
 uv run python -m eval.evaluate --limit 3 # 评估（试跑3条）
 uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/3/5/8）
+uv run python -m scripts.analyze_logs    # 汇总问答日志画像（意图/检索/反思/成本/耗时）
+uv run python -m app.ingest.sync_graph   # knowledge_graph.json → Neo4j（--check-only 只比对）
 ```
 
 ---
@@ -114,11 +116,11 @@ llm_wiki_laws/
 ├── knowledge_graph.json    # 知识点关联图谱（可重新生成，被 gitignore）
 ├── logs/qa.log             # 问答日志（被 gitignore）
 ├── eval/                   # 评估（Ragas 0.3）
-│   ├── qa_test_cases.jsonl #   35 条法律评估用例
+│   ├── qa_test_cases.jsonl #   55 条法律评估用例（劳动法/劳动合同法 35 + 民法典 20）
 │   ├── metrics.py          #   recall@k 指标（自定义）
 │   ├── evaluate.py         #   评估主程序
 │   └── results/            #   结果输出（被 gitignore）
-└── tests/                  # 单元测试（pytest，185 项；全部离线，不连 Milvus/大模型）
+└── tests/                  # 单元测试（pytest，201 项；全部离线，不连 Milvus/大模型）
 ```
 
 ---
@@ -154,7 +156,8 @@ llm_wiki_laws/
   且不做 `$` 变量展开（避免密码被悄悄改写）。文件不入库，模板见 `docker/.env.example`。
 - **图数据库**：`NEO4J_URI`（默认 `bolt://localhost:7687`）/`NEO4J_USER`/`NEO4J_PASSWORD`/`NEO4J_DATABASE`
 - **多跳链路**：`RETRIEVAL_MODE`（`reflect` 默认 / `bfs` 对照）/ `REFLECT_MODEL`（默认 `qwen-turbo`）/ `REFLECT_MAX_ROUNDS`（默认 3，防失控）/ `REFLECT_TIMEOUT_S`（默认 15，超时即停）
-- 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（生成上下文最多 15 块）
+- 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（**均可环境变量覆盖**，便于 A/B）
+  → 生成上下文 = 10 种子 + ≤5 扩展 + 反思补取，**15 起**（实测见过 17）
 
 ### 5.2 知识构建管线（`app/ingest/`）
 
@@ -241,7 +244,7 @@ llm_wiki_laws/
 **`hybrid_retriever.py`**（核心，多跳）：
 - RRF 融合：`score = Σ 1/(60+rank)`，关键词与向量两路并集
 - `_bfs_expand()`：图谱**多跳扩展**——从种子节点沿边 BFS 最多 `expand_hops` 跳，分数 = 种子分 × 边权重 × `decay^hop`，逐跳剪枝，最终取前 `expand_k` 个
-- `search(query, top_k)` 返回 **top_k 种子 + 至多 expand_k 扩展**（默认 10 + 5，最多 15 块，生成器全用）
+- `search(query, top_k)` 返回 **top_k 种子 + 至多 expand_k 扩展**（默认 10 + 5 = 15 起；反思链路的 `ReflectiveRetriever` 还会在其上补取，实测最多见过 17 块，生成器全用）
 - **已知局限**：宽泛"措施/责任"类问题（如同时涉及多法多条文）扩展易被稀释，部分期望条文会落入扩展区甚至丢失（详见 §6 评估结果）。
 
 ### 5.5 生成（`app/generation/`）
@@ -306,16 +309,31 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 
 ### 5.8 日志（`app/logger.py`）
 
-- `RotatingFileHandler` 滚动写入 `logs/qa.log`（5MB×5）
-- `log_qa_event()`：每次问答记录 JSON 事件 `{time,user_id,query,knowledge_blocks,answer,retrieval_ms,generation_ms}`
-- `knowledge_blocks` 含 `id/title/score/source`（不含正文）
+- `RotatingFileHandler` 滚动写入 `logs/qa.log`（5MB×5），每次问答一条 JSON，**字段按需出现**。
+- `log_qa_event()` 的字段分工（**三类来源分开记**，用于排查"某个法条为什么没进上下文"）：
+  | 字段 | 含义 |
+  |---|---|
+  | `query` / `answer` | 用户问题 / 最终回答 |
+  | `mode` | 检索链路 `reflect` / `bfs` |
+  | `seeds` | **检索命中**（RRF 种子，id/标题/分数） |
+  | `graph_expanded` | **图谱扩展**带进来的（id/标题/分数/**hop**） |
+  | `reflect_fetched` | **反思沿引用补取**的（id/标题/**第几轮**） |
+  | `reflect` | `{rounds, reasons}`，审计"为什么停在第几轮" |
+  | `intent` / `intent_reason` | 意图分类结果与理由（兜底路径也能看出为何不检索） |
+  | `memory_recalled` | 长期记忆召回 `{count, kinds}`（**不含正文**） |
+  | `knowledge_blocks` | 送进生成的**全部**知识块（id/title/score/source，不含正文） |
+- 轨迹由检索器提供：`HybridRetriever.last_trace`（seeds/expanded，含跳数）、
+  `ReflectiveRetriever.last_trace`（在其上补 fetched/rounds/reasons），`kb.last_trace` 透出；
+  `log_qa_event(trace=...)` 负责拆成上面各字段。CLI 与 Web 两条入口记录字段一致。
 
 ---
 
 ## 6. 评估体系（`eval/`）
 
-**数据**：`eval/qa_test_cases.jsonl`，**35 条劳动法评估用例**：
-- 字段：`id/type/question/answer/expected_knowledge/source_sections/sub_questions`
+**数据**：`eval/qa_test_cases.jsonl`，**55 条**（劳动法/劳动合同法 35 条 + **民法典 20 条**）：
+- 字段：`id/type/source/question/answer/expected_knowledge/source_sections/sub_questions`
+- **`source`：来源法律**（`民法典`/`劳动法`/`劳动合同法`，跨法用例为多项）——评估结果可按法律分组；`--source 民法典` 可只跑某部法律的用例。由脚本按 `expected_knowledge` 反推并校验，非手填。
+- **引用关系型用例**（民法典 10 条多跳）：`expected_knowledge` **同时列出"引用方"与"被引方"**，如「买卖合同价款约定不明」期望 第六百二十六条 + 第五百一十条 + 第五百一十一条 —— 这样 recall@k 直接量化"引用链有没有被带进上下文"。全部引用关系已用 `crossref_map()` 校验（被引条号确实出现在引用方正文里，共 17 处）。
 - `type`：`single_hop` / `multi_hop` / `complex`（含子问题拆分）
 - 覆盖：试用期、竞业限制、经济补偿、加班、非全日制、劳务派遣、经济性裁员、孕期女职工保护、劳动争议处理、劳动监察等
 - `answer` 作为 ragas `ground_truth`；`expected_knowledge`（知识点 id，与图谱 KP 编号对应）用于 recall@k 比对
@@ -329,17 +347,20 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 - 检索走 `KnowledgeBase.load()`，**即 Milvus**（Milvus 挂了会退化成纯关键词，recall 会明显下降——评估前先确认向量库在跑）
 - LLM：`LangchainLLMWrapper(ChatOpenAI(base_url=DashScope, model=qwen-max))`
 - Embeddings：**必须用 `langchain_community.embeddings.DashScopeEmbeddings`**（`text-embedding-v3`）经 `LangchainEmbeddingsWrapper` 包装。⚠️ 曾踩坑：`langchain_openai.OpenAIEmbeddings` 配 DashScope 会报 `input.contents is neither str nor list of str`。
-- 参数：`--limit N` 试跑、`--skip-ragas` 仅检索质量、`--top-k`（默认 5）、`--case-file`
+- 参数：`--limit N` 试跑、`--skip-ragas` 仅检索质量、`--top-k`（默认 5）、`--case-file`、`--source <法律>`
 
-**当前实测结果**（2026-09-13，35 条，`--skip-ragas`，民法典入库后）：
-- recall@1：**0.431**、recall@3：**0.7119**、recall@5：**0.8405**、recall@8：**0.9262**
+**当前实测结果**（2026-09-13，55 条，`--skip-ragas`）：
+- 总体：recall@1 **0.4894**、recall@3 **0.7288**、recall@5 **0.8591**、recall@8 **0.947**
+- **按来源法律**：民法典（20 条）**0.5917 / 0.7583 / 0.8917 / 0.9833**；劳动合同法（26 条）0.4135 / 0.6923 / 0.8462 / 0.9487；劳动法（10 条）0.4333 / 0.6917 / 0.7417 / 0.775
+- 两部劳动法 35 条的基线（0.431 / 0.7119 / 0.8405 / 0.9262）未变，可与历史结果直接对比
+- 民法典 @8=0.983：多跳用例里**被引条文基本都进了上下文**（用例期望同时含引用方与被引方）
 - 与民法典入库前基线（0.40 / 0.69 / 0.84 / 0.92）持平或略升——两部劳动法的知识点编号未变，向量检索也从"只在前 205 节点里排序"恢复为全库 1465 节点
 - 多跳/复杂用例的依赖条文主要靠 **crossref 图谱扩展**带进上下文（46→38、65→39、42→45、41→46 等）
 - **已知薄弱**：宽泛的"措施/责任"类问题（eval_026 拖欠工资维权、eval_030 维权途径、eval_025 孕期违法解除）期望条文未必全部落入 top-8；生成器在缺失部分条文时仍能基于已召回的相关条文给出**合法合理**的答案（冒烟测试验证）
 
 ---
 
-## 7. 测试（`tests/`，185 项全过）
+## 7. 测试（`tests/`，201 项全过）
 
 | 文件 | 覆盖 |
 |---|---|
@@ -360,7 +381,9 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 | `test_intent.py` | 意图三分类、容错解析、故障保守放行、兜底话术（mock LLM） |
 | `test_cli_intent.py` | CLI 意图路由：非可答跳过检索与生成、兜底仍写记忆与日志、混合序列只让可答题进检索 |
 | `test_generation.py` | 流式逐块、聚合、prompt 组装与多跳引导、**上下文标题带法律名**（mock LLM） |
-| `test_logger.py` | 日志 JSON 事件、缺失耗时兜底 |
+| `test_logger.py` | 日志 JSON 事件、缺失耗时兜底、**三类来源（seeds/graph_expanded/reflect_fetched）分开记录**、字段按需出现 |
+| `test_analyze_logs.py` | 日志画像：解析容错（坏行/缺字段）、停止原因归类（未知归 other）、成本估算、用户过滤 |
+| `test_graph_store.py` | Neo4j 图存储：Cypher 与参数、全量对齐、四类关系拆分、`:CROSSREF` 方向派生、节点对归一化、seq 排序（假 driver，离线） |
 | `test_eval.py` | recall@k 指标、评估数据行组装（mock 检索/生成） |
 | `test_pipeline.py` | PDF 发现、增量转换、md 发现、多文档全局编号 |
 | `test_wiki_writer.py` | 概念导航链接渲染、跨文档条文消歧、**编→章 两级目录分组**、**章号数值排序** |
@@ -414,7 +437,8 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 13. **多法同条号混淆**：多部法律同有 85/98 等条文号，生成上下文标题必须带法律名，否则 LLM 会张冠李戴；民法典标题还带编名。
 14. **bge-m3 模型较大**（2.2GB），首次加载慢；`graph_build` 编码一次后向量复用（语义边 + Milvus 写入库），不要再重复编码。
 15. **知识库规模**：1465 知识点 / 21252 边（sibling 15306 / semantic 11720 / keyword 3446 / crossref 97）；语义阈值 0.75（0.65 会近全连接），keyword 0.3，crossref 权重 1.5。
-16. `.gitignore` 忽略：`data/`、`knowledge_graph.json`、`logs/`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。⚠️ **`wiki/` 已不再被忽略**，`wiki/concepts/` 下的页面与其 `.obsidian/`（Obsidian 本地配置）都会被提交，改动时注意别把编辑器状态一起带进去。
+16. `.gitignore` 忽略：`data/`、`logs/`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。
+    **知识本体全部入库**：`knowledge_graph.json` 与 `wiki/`（1465 个知识点页 + index + log）都被 git 跟踪，便于看差异与审计；唯一例外是 `wiki/concepts/.obsidian/`（Obsidian 本地 UI 状态，已忽略且已移出跟踪）。
 17. **意图识别别"两头堵"**：分类器**只做路由**，不参与知识定位；且任何故障都要**保守放行**（归 `ANSWERABLE`）。反过来若把分类做得过于激进，正常法律问题会被误判成"未覆盖"而白白拒答——改动分类提示词或换模型后，跑 `uv run python -m eval.evaluate --skip-ragas --intent` 看误判率（用例全是法律题，非 `answerable` 即为误判）。
 18. **反思式检索别做成"纯反思"**：曾实现过一版"反思完全替代图谱扩展、候选只有引用关系"，recall@8 从 **0.9262 掉到 0.8548** —— 掉的全是 sibling/semantic 邻居带来的补充（它们不属于"引用关系"）。现方案是 **reflect = 基础扩展 + 反思补取**（超集），recall 与 bfs 完全一致（0.431/0.7119/0.8405/0.9262）。改这块务必先跑 `RETRIEVAL_MODE=reflect` 与 `bfs` 两遍 `eval --skip-ragas` 对比。
 19. **反思的增量天然有限**：全库只有 **68/1465** 个知识点正文里有可跟进的同法引用（97 处），且这些被引条文大多已被基础扩展（crossref 权重 1.5）带进上下文。实测 35 条用例中：19 条因"无引用关系"零额外调用、约 20 条各多 1 次 qwen-turbo、**只有 2 条真正补到条文（+4 个知识点）**。若想让反思承担更多，可考虑调低 BFS 的 crossref 权重把引用链让给反思（未验证）。
@@ -431,7 +455,11 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 30. **同一函数里派生副本的失败策略要一致**：pipeline 里 Milvus 写入原本 try/except 警告后继续，而 Neo4j 同步直接失败——两者都是派生副本，已统一为**都显式失败**（json 已落盘，构建结果不会丢）。
 31. **改完 `kb.load()` 后留意变量名**：我曾用 `store = Neo4jGraphStore()` 覆盖了 `load(store=...)` 这个**注入 Milvus 向量库的参数**，导致测试注入失效（`test_kb` 抓到）。图存储请用 `graph_store` 之类的名字。
 32. **凭证只放一处**：服务账号密码集中在 `docker/.env`（不入库），compose 与应用共用；应用侧用 `python-dotenv`（`override=False, interpolate=False`）只填空缺、**不覆盖已有环境变量**、不展开 `$`。密码里应避免 `$`（compose 需 `$$` 转义，而 dotenv 按字面读取不还原）。注意由此带来的变化：应用的 MySQL 连接账号从 `root` 变成了 `.env` 里的 `vincent`（最小权限，已验证建表/读写/画像都够用）；想继续用 root 就把 `MYSQL_USER` 改回 root。
-33. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
+33. **图谱已纳入 git**：`knowledge_graph.json` 现被跟踪（提交在「数据库迁移neo4j」），`.gitignore` 里那条旧忽略规则已删——留着虽对已跟踪文件无效，却会让 `git check-ignore` 误导性地报"已忽略"。同时把 `wiki/` 从忽略里移除、1260 个新知识点页纳入版本库（git 里现为 1465 页 + index + log），并把 5 个 `.obsidian/` UI 状态文件移出跟踪（磁盘保留）——此前它们是"已跟踪但被忽略"，与刚修的那个矛盾同源。
+34. **测试绝不能写生产日志**：API 层用的是模块级真实 logger，`tests/conftest.py` 若不替换它，**跑一次 pytest 就往 `logs/qa.log` 写几十条假问答事件**（曾污染 297 条、占日志 69%，既毁审计也毁日志分析）。夹具已注入 `NullLogger`，并有回归测试卡住（`test_api_tests_do_not_write_production_log`）。
+35. **config 里的参数一定确认真的传下去了**：`kb.py` 构造 `HybridRetriever` 时曾**没传** `EXPAND_K/EXPAND_HOPS/EXPAND_DECAY`，于是长期沿用构造函数默认 `expand_k=3`，而 config 与文档都写着 5 —— 是日志里 `graph_expanded` 恒为 3 才暴露的。`TOP_K` 之所以正常，是因为它由调用方（CLI/Web/eval）显式传给 `search(top_k=...)`。现已显式传入并有回归测试（`test_expand_params_flow_from_config`）。
+36. **`EXPAND_K` 只影响第 6 位之后的补充条数**：eval 用 `--top-k 5`，`recall@8` 只看前 8 位（= 5 种子 + 前 3 扩展），而 hop=1 的扩展分数最高，所以 `EXPAND_K` 从 3 改到 5 **recall@1/3/5/8 逐位不变**（实测两组数字完全相同）；它的真实影响在**生成上下文规模**：生产路径 13 → 15 块。评估想反映扩展规模，得调 `--top-k` 而不是只看 recall。
+37. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
 
 ---
 
@@ -450,7 +478,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 ## 11. 验收/继续开发检查清单
 
 - [ ] Milvus 在跑：`docker ps` 见 `milvus-standalone`（宿主机端口 **19532**）
-- [ ] `uv run python -m pytest tests/ -v` → **185 passed**
+- [ ] `uv run python -m pytest tests/ -v` → **201 passed**
 - [ ] `uv run python -m app.ingest.pipeline` → **1465 知识点 / 21252 关联边** + `向量已写入 Milvus 集合 llm_wiki_laws：1465 条`
 - [ ] Milvus 条数核对：`MilvusVectorStore().count()` → 1465
 - [ ] `export API_KEY=... && uv run python -m app.cli` → 多轮问答正常（含民法典问题，如"高空抛物致人损害谁担责"应命中第一千二百五十四条）

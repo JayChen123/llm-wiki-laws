@@ -94,7 +94,7 @@ REFLECT_MAX_ROUNDS = int(os.getenv("REFLECT_MAX_ROUNDS", "3"))  # 反思轮数�
 REFLECT_TIMEOUT_S = float(os.getenv("REFLECT_TIMEOUT_S", "15"))  # 超时即停止继续检索
 
 # 检索参数
-TOP_K = 10  # 混合检索返回的知识点数量
-EXPAND_K = 5  # 沿关联边扩展的知识点数量（最终补充条数）
-EXPAND_HOPS = 3  # 图谱多跳扩展的最大跳数（BFS）
-EXPAND_DECAY = 0.5  # 多跳扩展的分数逐跳衰减系数
+TOP_K = int(os.getenv("TOP_K", "10"))  # 混合检索返回的知识点数量（种子）
+EXPAND_K = int(os.getenv("EXPAND_K", "5"))  # 沿关联边扩展的知识点数量（最终补充条数，也用作每跳预算）
+EXPAND_HOPS = int(os.getenv("EXPAND_HOPS", "3"))  # 图谱多跳扩展的最大跳数（BFS）
+EXPAND_DECAY = float(os.getenv("EXPAND_DECAY", "0.5"))  # 多跳扩展的分数逐跳衰减系数
