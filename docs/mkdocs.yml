@@ -1,11 +1,11 @@
-site_name: 法律问答系统llm-wiki-v2
-site_description: 法律问答系统llm-wiki-v2
+site_name: 法律问答系统(llm-wiki)-v2
+site_description: 法律问答系统(llm-wiki)-v2
 site_author: Vincent(陈杰)
 copyright: "法律知识问答系统 · 黑马研发"
 
 # 文档源 = docs/课件，产物 = docs/site
 docs_dir: 课件
-site_dir: "法律问答系统llm-wiki-v2"
+site_dir: "法律问答系统(llm-wiki)-v2"
 
 use_directory_urls: false
 
