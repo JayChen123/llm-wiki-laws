@@ -1,14 +1,23 @@
-"""项目应用配置：路径与检索参数。
+"""项目应用配置：**配置的唯一来源**（路径、模型、向量库、图库、记忆、检索参数）。
 
-LLM 与向量模型配置复用项目根目录 config.py（用户维护的单一配置源）。
+历史上的"根 config.py + app 复用"已作废（根 config.py 不存在）；
+服务凭证集中在 docker/.env，由下面的 load_dotenv 读入。
 """
+import os
 import sys
 from pathlib import Path
-import os
+
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+
+# 服务凭证集中在 docker/.env（compose 也读同一份），改一处即可让容器与应用一致。
+# - override=False：**只填空缺、不覆盖已有环境变量**（真实环境变量优先，容器化/CI 可覆盖）
+# - interpolate=False：凭证里若含 $ 不被当作变量展开（避免密码被悄悄改写）
+load_dotenv(BASE_DIR / "docker" / ".env", override=False, interpolate=False)
 
 # from config import Config as _UserConfig  # noqa: E402
 
@@ -19,7 +28,6 @@ RAW_DIR = DATA_DIR / "raw"  # markdown 原始文件（PDF 转换产物 + 用户�
 WIKI_DIR = BASE_DIR / "wiki"
 CONCEPTS_DIR = WIKI_DIR / "concepts"
 GRAPH_PATH = BASE_DIR / "knowledge_graph.json"
-MEMORY_DB_PATH = BASE_DIR / "memory.db"  # 仅作一次性迁移脚本的源路径（运行时不再使用）
 
 # 记忆后端：MySQL（唯一后端，无降级）；下述连接参数可用环境变量覆盖
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
@@ -27,6 +35,14 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3308"))       # 宿主机映射端口�
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "12345678")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "subjects_kg")
+
+# Neo4j 图数据库：知识图谱（节点 + 关联边）的查询副本
+# **权威源仍是 knowledge_graph.json**（可 git diff）；pipeline 写 json 后同步到 Neo4j，
+# 应用从 Neo4j 读图。改了 json 就重跑同步（uv run python -m app.ingest.sync_graph）。
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "12345678")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 # 长期记忆（用户画像 + 历史问答语义索引）
 MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "llm_wiki_user_memory")
@@ -38,6 +54,15 @@ PROFILE_MODEL = os.getenv("PROFILE_MODEL", "qwen-turbo")
 # 短期记忆注入检索词的策略：auto=仅像追问时才并入上一问（默认）；always=总是并入；off=从不
 MEMORY_INJECT_MODE = os.getenv("MEMORY_INJECT_MODE", "auto")
 
+# Web API（P4）：JWT 与监听地址
+# JWT_SECRET 生产环境必须用环境变量覆盖（默认值仅供本地开发，长度≥32 以满足 HS256 建议）
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-insecure-secret-please-override-in-env")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = int(os.getenv("JWT_EXPIRE_DAYS", "7"))
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8080"))
+WEB_DIST_DIR = BASE_DIR / "web" / "dist"      # Vite 构建产物，由 FastAPI 托管
+
 # Milvus 向量库：知识点向量的存储与检索（服务端见 docker/docker-compose.yml）
 # 端口是宿主机映射端口（容器内为 19530），换环境改环境变量即可
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
@@ -48,7 +73,10 @@ MILVUS_INDEX = "HNSW"
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))  # bge-m3 输出维度
 
 # 向量编码模型（bge-m3）与大模型（qwen-max）
-BGE_MODEL_PATH = "/Users/chan/projects/Itcast_qa_system/rag_qa/models/bge-m3"
+# bge-m3 模型路径：**机器相关**，容器/换机请用环境变量覆盖（compose 里指向只读挂载点）
+BGE_MODEL_PATH = os.getenv(
+    "BGE_MODEL_PATH", "/Users/chan/projects/Itcast_qa_system/rag_qa/models/bge-m3"
+)
 LLM_MODEL = "qwen-max"
 DASHSCOPE_API_KEY = os.getenv("API_KEY") or "api_key"
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"

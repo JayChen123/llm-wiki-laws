@@ -1,8 +1,8 @@
 """知识库加载与统一检索入口。"""
 from __future__ import annotations
 
-from app.config import GRAPH_PATH, REFLECT_MAX_ROUNDS, RETRIEVAL_MODE
-from app.ingest.graph_build import load_graph
+from app.config import REFLECT_MAX_ROUNDS, RETRIEVAL_MODE
+from app.ingest.graph_store import Neo4jGraphStore
 from app.retrieval.embedder import Embedder
 from app.retrieval.hybrid_retriever import HybridRetriever
 from app.retrieval.keyword_retriever import KeywordRetriever
@@ -38,7 +38,18 @@ class KnowledgeBase:
             embedder: Embedder | None = None,
             store: MilvusVectorStore | None = None,
     ) -> "KnowledgeBase":
-        graph = load_graph(GRAPH_PATH)
+        # 图谱从 Neo4j 读（权威源是 knowledge_graph.json，由 pipeline/同步命令写入 Neo4j）。
+        # 不做降级：Neo4j 不可用即报错，避免"以为在用图数据库、实际读了本地文件"。
+        # 注意变量名不要用 store —— 那个名字留给下面注入的 Milvus 向量库（测试会替换它）
+        graph_store = Neo4jGraphStore()
+        try:
+            graph = graph_store.load()
+        finally:
+            graph_store.close()
+        if not graph["nodes"]:
+            raise RuntimeError(
+                "Neo4j 里没有知识点：请先运行 `uv run python -m app.ingest.sync_graph` 同步图谱"
+            )
         nodes = graph["nodes"]
         if embedder is None:
             embedder = Embedder()

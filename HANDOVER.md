@@ -1,7 +1,7 @@
 # 项目交接文档
 
 > 本文档用于交接，供后续接入的大模型（或开发者）快速掌握本项目全貌，无需重新摸索即可继续开发。
-> 最后更新：2026-09-13（v1.1：新增《民法典》、向量迁移至 Milvus）
+> 最后更新：2026-09-13（v1.1：民法典 + Milvus 向量 + 意图识别 + 反思式多跳 + 双层记忆 + Web 多用户）
 
 ---
 
@@ -44,7 +44,9 @@
 ```bash
 uv run python -m app.ingest.pipeline     # 构建知识库（全量重建，幂等）
 uv run python -m app.cli                 # 启动命令行问答
-uv run python -m pytest tests/ -v        # 运行全部测试（当前 140 项）
+cd web && npm run build && cd ..         # 构建前端（产物 web/dist，由 FastAPI 托管）
+uv run python -m app.api.main            # 启动 Web 服务（http://localhost:8080）
+uv run python -m pytest tests/ -v        # 运行全部测试（当前 185 项）
 uv run python -m eval.evaluate --limit 3 # 评估（试跑3条）
 uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/3/5/8）
 ```
@@ -72,9 +74,11 @@ llm_wiki_laws/
 │       ├── 中华人民共和国民法典.md          # 7 编 1260 条，含"编/分编"与千位条号
 │       └── 中华人民共和国劳动法_中华人民共和国人力资源和社会保障部.md
 ├── docker/
-│   └── docker-compose.yml  # Milvus v2.4.4 + etcd/minio + redis + mysql（端口见文件）
+│   └── docker-compose.yml  # Milvus + etcd/minio + redis + mysql + neo4j（端口见文件）
+├── web/                    # 前端（React+Vite+Tailwind v4）：登录注册 / 多会话 / 流式问答 / 引用溯源
 ├── app/
-│   ├── config.py           # 应用配置（**唯一配置源**：路径、bge-m3、LLM、Milvus、检索参数）
+│   ├── api/                # ⑤ Web API（FastAPI）：认证 + 会话 + SSE 问答 + 托管前端产物
+│   ├── config.py           # 应用配置（**唯一配置源**：路径、bge-m3、LLM、Milvus、MySQL、JWT、检索参数）
 │   ├── kb.py               # 知识库加载与统一检索入口
 │   ├── cli.py              # 命令行交互式问答（含短期记忆 + 日志）
 │   ├── logger.py           # 结构化问答日志
@@ -84,6 +88,8 @@ llm_wiki_laws/
 │   │   ├── knowledge_extract.py# 清洗 + 编/章/节/条切分提取知识点
 │   │   ├── concept_map.py      # 法律概念→条文映射表 + 关键词增强
 │   │   ├── graph_build.py      # 关联图谱构建（4 类边）
+│   │   ├── graph_store.py      # 图谱的 Neo4j 读写（四类关系拆分/全量对齐/批量 UNWIND/seq 排序）
+│   │   ├── sync_graph.py       # knowledge_graph.json → Neo4j 同步入口
 │   │   └── wiki_writer.py      # Wiki 页面落盘（含核心概念导航）
 │   ├── retrieval/          # ② 混合检索
 │   │   ├── embedder.py         # bge-m3 向量编码（测试用假编码器在各测试文件内定义）
@@ -107,13 +113,12 @@ llm_wiki_laws/
 │   └── concepts/KP_*.md    #   每个知识点一页（含双向链接）
 ├── knowledge_graph.json    # 知识点关联图谱（可重新生成，被 gitignore）
 ├── logs/qa.log             # 问答日志（被 gitignore）
-├── memory.db               # 旧 SQLite 记忆（仅迁移脚本的源文件，运行时不再使用）
 ├── eval/                   # 评估（Ragas 0.3）
 │   ├── qa_test_cases.jsonl #   35 条法律评估用例
 │   ├── metrics.py          #   recall@k 指标（自定义）
 │   ├── evaluate.py         #   评估主程序
 │   └── results/            #   结果输出（被 gitignore）
-└── tests/                  # 单元测试（pytest，140 项；全部离线，不连 Milvus/大模型）
+└── tests/                  # 单元测试（pytest，185 项；全部离线，不连 Milvus/大模型）
 ```
 
 ---
@@ -138,11 +143,16 @@ llm_wiki_laws/
 
 **`app/config.py`**：
 - `SRC_DIR` / `RAW_DIR`：`data/src` / `data/raw`
-- `WIKI_DIR` / `CONCEPTS_DIR` / `GRAPH_PATH`（`MEMORY_DB_PATH` 仅作迁移脚本源路径）
+- `WIKI_DIR` / `CONCEPTS_DIR` / `GRAPH_PATH`
 - **记忆（MySQL/Milvus）**：`MYSQL_HOST`/`MYSQL_PORT`（默认 **3308**）/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE`、`MEMORY_COLLECTION`、`MEMORY_RECALL_K`、`MEMORY_SUMMARY_CHARS`、`PROFILE_EXTRACT_EVERY`、`PROFILE_MODEL`、`MEMORY_INJECT_MODE`
 - `BGE_MODEL_PATH`（**本地模型路径，机器相关，换环境先改这里**；指向 Itcast 目录仅是用户提供的配置值，**不作为实现参考**）/ `LLM_MODEL` / `DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL`
 - **Milvus**：`MILVUS_HOST` / `MILVUS_PORT`（默认 **19532**，是宿主机映射端口，容器内是 19530）/ `MILVUS_COLLECTION` / `MILVUS_METRIC=COSINE` / `MILVUS_INDEX=HNSW` / `EMBED_DIM=1024`，均可用环境变量覆盖
 - **意图识别**：`INTENT_ENABLED`（默认开）/ `INTENT_MODEL`（默认 `qwen-turbo`）/ `INTENT_TIMEOUT_S`（默认 3，超时保守放行）
+- **服务凭证集中在 `docker/.env`**（`MYSQL_*`/`NEO4J_*`/`REDIS_PASSWORD`/`MINIO_*`/`JWT_SECRET`）：
+  compose 自动读取它，应用侧用 `python-dotenv` 的 `load_dotenv(..., override=False, interpolate=False)` 读同一份
+  —— **只填空缺、不覆盖已有环境变量**（真实环境变量优先，容器化/CI 可用导出变量覆盖），
+  且不做 `$` 变量展开（避免密码被悄悄改写）。文件不入库，模板见 `docker/.env.example`。
+- **图数据库**：`NEO4J_URI`（默认 `bolt://localhost:7687`）/`NEO4J_USER`/`NEO4J_PASSWORD`/`NEO4J_DATABASE`
 - **多跳链路**：`RETRIEVAL_MODE`（`reflect` 默认 / `bfs` 对照）/ `REFLECT_MODEL`（默认 `qwen-turbo`）/ `REFLECT_MAX_ROUNDS`（默认 3，防失控）/ `REFLECT_TIMEOUT_S`（默认 15，超时即停）
 - 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（生成上下文最多 15 块）
 
@@ -190,7 +200,28 @@ llm_wiki_laws/
 - `_resolve_concept(law, article, points)`：概念条文 → 知识点 id，未命中回退纯文本"《law》第X条"
 - `_concept_index_section(points)`：渲染"## 核心概念导航"，概念项链接到 `[[KP_xxx|第X条]]`
 
-### 5.3 混合检索（`app/retrieval/`）
+### 5.3 图谱存储（`app/ingest/graph_store.py` + `sync_graph.py`）
+
+- **权威源是 `knowledge_graph.json`**（可 git diff、可审计；用户明确要求保留，不删）。pipeline 写完 json 后
+  调 `sync_from_json()` 同步到 Neo4j；`kb.load()` 从 **Neo4j** 读图。
+- **建模**：节点标签 `KnowledgePoint`（属性与 json 字段一一对应，**含正文 content** —— 反思候选
+  `crossref_map()` 要解析正文里的引用）；边按四类拆成 `:SIBLING`/`:KEYWORD`/`:SEMANTIC`/`:CROSSREF`，
+  一条多类型边拆成多条关系，故 **30569 条关系 > 21252 条边**；`load()` 按 (source,target) 聚合
+  （types 取并集、weight 取 max）与 json 1:1 还原。
+- **`:CROSSREF` 方向在同步时派生**：json 的 `source/target` 是 id 字典序而非引用方向（97 条 crossref 边
+  全部 source<target），故同步时用 `crossref_map()`（与反思候选同一份实现）从正文解析方向，
+  按 `引用方 -[:CROSSREF]-> 被引方` 建关系 → 可直接做有向引用链遍历（`-[:CROSSREF*1..3]->`），
+  **无需改 json 格式**。只取 json 里存在的 crossref 节点对，保证仍是忠实副本。
+- **节点对归一化**：`:CROSSREF` 有向、同一对节点可能双向各一条关系，而 json 一条边只对应 `(min,max)`；
+  `load()` 与 `counts()` 都按 `(min,max)` 归一化后聚合，边数与 json 恒等（21252），recall 不变。
+- **`seq` 属性**：id 形如 KP_1000 与 KP_999 的字典序 ≠ 数值序，用 seq 排序才能还原 json 顺序
+  （顺序影响检索并列打破，是 recall 可比的前提）。
+- **写入是全量对齐**：先清空 `:RELATED`、按新图重建、最后 `DETACH DELETE` 不在新图中的节点。
+- **空列表不能作属性值**：关键词为空要存 None，读回再还原成 `[]`。
+- **无降级**：Neo4j 不可用即报错（`kb.load()` 里若图为空会明确提示先跑同步），不退回读本地文件。
+- 同步命令：`uv run python -m app.ingest.sync_graph [--check-only]`。
+
+### 5.4 混合检索（`app/retrieval/`）
 
 **`embedder.py`**：
 - `Embedder`：基于 sentence-transformers 加载 bge-m3，`encode()` 输出 L2 归一化向量（dim 1024）
@@ -213,7 +244,7 @@ llm_wiki_laws/
 - `search(query, top_k)` 返回 **top_k 种子 + 至多 expand_k 扩展**（默认 10 + 5，最多 15 块，生成器全用）
 - **已知局限**：宽泛"措施/责任"类问题（如同时涉及多法多条文）扩展易被稀释，部分期望条文会落入扩展区甚至丢失（详见 §6 评估结果）。
 
-### 5.4 生成（`app/generation/`）
+### 5.5 生成（`app/generation/`）
 
 **`intent.py`**（问答前路由）：
 - 三分类 `Intent`：`ANSWERABLE`（可答）/ `LEGAL_UNCOVERED`（法律相关但本库未覆盖，如刑法/行政法/公司法）/ `OFF_TOPIC`（与法律无关）
@@ -230,7 +261,7 @@ llm_wiki_laws/
 - **SYSTEM_PROMPT 为民事法律领域定制**："依据《中华人民共和国民法典》《中华人民共和国劳动法》《中华人民共和国劳动合同法》…解答劳动权益、劳动合同…以及合同、物权、侵权责任、婚姻家庭、继承等民事法律问题…涉及具体规定时点明法律依据…不要臆造法条…末尾列出全部引用"
 - `_format_contexts()`：每条 context 截断 600 字；**标题带法律名**（从 `source` 提取，如 `中华人民共和国劳动合同法·第四章·第八十五条`）——多部法律同章同条号，不带法律名会导致 LLM 张冠李戴。民法典的标题还会自带编名（`中华人民共和国民法典·第七编 侵权责任·第十章·第一千二百五十四条`）
 
-### 5.5 双层记忆（`app/memory/`）
+### 5.6 双层记忆（`app/memory/`）
 
 **短期（`mysql_store.MySQLMemoryStore`，MySQL 唯一后端）**
 - 表：`users` / `sessions` / `messages(session_id, user_id, role, content)` / `user_profile`（utf8mb4）
@@ -251,7 +282,17 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 **检索词注入（`memory.build_search_query`）**：`MEMORY_INJECT_MODE=auto`（默认）只在问题"像追问"
 （含指代词，或很短且无法律实体词）时才并入上一问，修掉换话题时的串题污染。
 
-### 5.6 知识库加载（`app/kb.py`）
+### 5.7 Web API（`app/api/`，P4）
+
+- **认证**：`auth.py` —— bcrypt 存密码（显式截断 72 字节）、JWT 放 **HttpOnly + SameSite=Lax Cookie**（JS 读不到，防 XSS 窃取；同源托管免 CSRF/CORS 配置）；注册即登录；登录失败**不区分**账号是否存在（防枚举）。
+- **依赖注入**：`deps.py` —— 当前用户 / KB / 记忆 / 生成器 / 分类器全部走 `Depends`，测试用 `app.dependency_overrides` 换成假实现，**接口测试完全离线**（不连 MySQL/Milvus/LLM）。
+  ⚠️ 依赖内部不要直接调用别的依赖函数（如 `current_user` 里直接 `get_memory_store()`），否则替换失效——必须写成 `Depends(...)` 参数。
+- **接口**：`POST /api/auth/{register,login,logout}`、`GET /api/auth/me`、`GET|POST /api/sessions`、`GET /api/sessions/{id}/messages`、`DELETE /api/sessions/{id}`、`POST /api/chat`（SSE）。
+- **SSE 事件**：`meta`（引用+耗时）→ `delta`*（正文分片）→ `citations` → `done`；兜底路径为 `fallback`（意图非可答）；生成失败发 `error` 但**仍返回 citations 并写记忆**。
+- **越权防护**：所有会话接口先 `session_belongs_to(session, user_id)`，不属于当前用户一律 **404**（不暴露存在性），且不触发检索。
+- **前端**（`web/`）：React 19 + Vite 8 + Tailwind v4（`@tailwindcss/vite`，无 config 文件）。`web/src/api.js` 用 **fetch + ReadableStream 手动解析 SSE**（`EventSource` 只支持 GET，而问答是 POST）。引用随 assistant 消息存 `messages.citations`（JSON），刷新/切会话后仍可溯源。
+
+### 5.8 知识库加载（`app/kb.py`）
 
 - `KnowledgeBase.load(embedder=None, store=None)`：加载图谱 + 连 Milvus + 构建 HybridRetriever；**Milvus 不可用**（服务未启动/集合不存在）时打印告警并退化为纯关键词检索，不抛异常。`store` 可注入供离线测试。
 - `search(query, top_k)` 统一检索入口
@@ -298,13 +339,14 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 
 ---
 
-## 7. 测试（`tests/`，140 项全过）
+## 7. 测试（`tests/`，185 项全过）
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_knowledge_extract.py` | 清洗、编/章/节/条解析、康熙部首变体、交叉引用排除、表格回填、关键词、**千位条号**、**编层级与同号章区分**、**分编边界**、**裸域名/斜杠日期噪音**、**`\f` 行号**、真实 md 提取（98/107/**1260** 条） |
 | `test_concept_map.py` | 概念映射的文档感知匹配、关键词注入去重、未映射跳过、**民法典概念（含千位条号）** |
 | `test_graph_build.py` | sibling/keyword/semantic 三类边 + **crossref 交叉引用边**（FakeEmbedder）+ **跨编同号章不建 sibling 边** + **千位条号 crossref** |
+| `test_graph_store.py` | Neo4j 图存储：Cypher 与绑定参数、全量对齐、批量、seq 排序、空关键词存 None（假 driver，离线） |
 | `test_milvus_store.py` | 集合 schema/索引、维度不符重建、全量对齐写入、**陈旧主键清理（含可见性延迟下的顺序回归）**、`(kp_id, score)` 返回、条数统计（假 client，离线） |
 | `test_kb.py` | Milvus 可用时启用向量检索、**不可用时退化为纯关键词且不抛异常** |
 | `test_retrieval.py` | BM25（含关键词字段）、向量（假 store）、RRF 融合、图谱多跳扩展 |
@@ -312,6 +354,9 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 | `test_reflective_retriever.py` | 四个停止条件、迭代取回、轮数上限、不污染图谱节点 |
 | `test_mysql_store.py` | MySQL 记忆后端：生成的 SQL 与绑定参数（user_id 隔离、排序 LIMIT、画像去重）、串题注入策略 |
 | `test_long_term.py` | 长期记忆：用户隔离、画像+历史召回、注入段落标注、后端故障直接暴露 |
+| `test_api_auth.py` | 注册/登录/登出、Cookie 安全属性、账号枚举防护、bcrypt 往返与超长密码 |
+| `test_api_sessions.py` | 会话 CRUD、**越权一律 404**、删除会话连带清长期记忆 |
+| `test_api_chat.py` | SSE 事件流、意图兜底跳过检索、生成失败仍返回引用、引用随历史持久化 |
 | `test_intent.py` | 意图三分类、容错解析、故障保守放行、兜底话术（mock LLM） |
 | `test_cli_intent.py` | CLI 意图路由：非可答跳过检索与生成、兜底仍写记忆与日志、混合序列只让可答题进检索 |
 | `test_generation.py` | 流式逐块、聚合、prompt 组装与多跳引导、**上下文标题带法律名**（mock LLM） |
@@ -369,15 +414,24 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 13. **多法同条号混淆**：多部法律同有 85/98 等条文号，生成上下文标题必须带法律名，否则 LLM 会张冠李戴；民法典标题还带编名。
 14. **bge-m3 模型较大**（2.2GB），首次加载慢；`graph_build` 编码一次后向量复用（语义边 + Milvus 写入库），不要再重复编码。
 15. **知识库规模**：1465 知识点 / 21252 边（sibling 15306 / semantic 11720 / keyword 3446 / crossref 97）；语义阈值 0.75（0.65 会近全连接），keyword 0.3，crossref 权重 1.5。
-16. `.gitignore` 忽略：`data/`、`knowledge_graph.json`、`logs/`、`memory.db`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。⚠️ **`wiki/` 已不再被忽略**，`wiki/concepts/` 下的页面与其 `.obsidian/`（Obsidian 本地配置）都会被提交，改动时注意别把编辑器状态一起带进去。
+16. `.gitignore` 忽略：`data/`、`knowledge_graph.json`、`logs/`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。⚠️ **`wiki/` 已不再被忽略**，`wiki/concepts/` 下的页面与其 `.obsidian/`（Obsidian 本地配置）都会被提交，改动时注意别把编辑器状态一起带进去。
 17. **意图识别别"两头堵"**：分类器**只做路由**，不参与知识定位；且任何故障都要**保守放行**（归 `ANSWERABLE`）。反过来若把分类做得过于激进，正常法律问题会被误判成"未覆盖"而白白拒答——改动分类提示词或换模型后，跑 `uv run python -m eval.evaluate --skip-ragas --intent` 看误判率（用例全是法律题，非 `answerable` 即为误判）。
 18. **反思式检索别做成"纯反思"**：曾实现过一版"反思完全替代图谱扩展、候选只有引用关系"，recall@8 从 **0.9262 掉到 0.8548** —— 掉的全是 sibling/semantic 邻居带来的补充（它们不属于"引用关系"）。现方案是 **reflect = 基础扩展 + 反思补取**（超集），recall 与 bfs 完全一致（0.431/0.7119/0.8405/0.9262）。改这块务必先跑 `RETRIEVAL_MODE=reflect` 与 `bfs` 两遍 `eval --skip-ragas` 对比。
 19. **反思的增量天然有限**：全库只有 **68/1465** 个知识点正文里有可跟进的同法引用（97 处），且这些被引条文大多已被基础扩展（crossref 权重 1.5）带进上下文。实测 35 条用例中：19 条因"无引用关系"零额外调用、约 20 条各多 1 次 qwen-turbo、**只有 2 条真正补到条文（+4 个知识点）**。若想让反思承担更多，可考虑调低 BFS 的 crossref 权重把引用链让给反思（未验证）。
 20. **跨话题串题（已在 P3 修复）**：`cli.py` 曾无条件把上一问并入检索词（`" ".join(past + [q])`）以处理"那/具体"指代，用户**换话题**时会污染检索词、并让反思顺着错话题补取条文（实测 P2：会话里先问"劳务派遣…"再问"试用期最长多久"，命中混入 KP_065/058/059）。现由 `memory.build_search_query(mode="auto")` 只在"像追问"（含指代词，或很短且无法律实体词）时才并入；修复后同一场景 Q2 的 13 块全是试用期条文，无劳务派遣残留。
-21. **记忆不做降级是有意为之**：曾实现过 SQLite 降级后端，但它在 `facts()` 里漏了 `user_id` 过滤，导致**画像跨用户泄漏**（单测 `test_alice/bob` 抓到）——降级路径同样要守隔离红线，且多用户场景（P4）下 MySQL 一挂就会踩到。现已**彻底删除 SQLite 记忆实现**：MySQL 是唯一后端，连不上直接报错，避免数据分散、也避免"以为在写 MySQL 实际写本地文件"。`MEMORY_DB_PATH` 仅保留给迁移脚本当源路径。
+21. **记忆不做降级是有意为之**：曾实现过 SQLite 降级后端，但它在 `facts()` 里漏了 `user_id` 过滤，导致**画像跨用户泄漏**（单测 `test_alice/bob` 抓到）——降级路径同样要守隔离红线，且多用户场景（P4）下 MySQL 一挂就会踩到。现已**彻底删除 SQLite 记忆实现**：MySQL 是唯一后端，连不上直接报错，避免数据分散、也避免"以为在写 MySQL 实际写本地文件"。（旧 `memory.db` 的 42 条已于 2026-09-13 迁入 MySQL 并删除文件与迁移脚本。）
 22. **Milvus 的 flush 坑在记忆库上又踩了一次**：`UserMemoryStore.clear()` 一开始漏了 `flush()`，真实 Milvus 上"清除我的数据"看似成功、其实延迟生效（当时 `count()` 仍读到旧值）。**写入与删除都要 flush**（见第 9 条）；假 client 必须忠实模拟"未 flush 查不到"，否则这类顺序问题在单测里蒙混过关。
 23. **长期记忆只注入生成、绝不并入检索词**：记忆是"用户背景"，不是法律知识。并入检索会重演串题污染，且可能让 LLM 把用户历史当成法条依据。注入段落显式标注"不得作为法律依据、不得列入引用"，`test_long_term.py` 有专测卡住这一点。
-24. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
+24. **容器化已放弃（决策，2026-09-13）**：曾写出多阶段 Dockerfile 与 compose `web` 服务并排障，最终按用户决定**移除容器化配置**，改为本地 `uv run python -m app.api.main` + `npm run build`。留档三条结论，日后若重做可省时间：① ghcr.io 与 `deb.debian.org` 在部分网络下不可达（后者解析到代理 fake-IP 段返回 503）——镜像不要依赖 ghcr，也尽量不用 apt；② uv 装 torch 时 `UV_TORCH_BACKEND` 与 `--torch-backend` 都**不可用**（本机 uv 0.8.5 无此特性、容器内 0.12.13 亦无），无法让 uv 自动切 CPU 源；③ Linux 的 PyPI torch 轮子是 **CUDA 链接版**（`import` 硬要 `libcudart.so.13`），只排除 `nvidia-*`/`triton`/`cuda-*` 会直接 `import torch` 失败；要纯 CPU 必须从 `https://download.pytorch.org/whl/cpu` 换成 `+cpu` 轮子（该源确有大 arm64 轮子）。
+25. **引用溯源要跟着消息一起存**：一开始引用只留在前端内存里，`onDone` 把流式文本转成历史消息时丢掉 citations，**回答一完成、最该被核对的溯源信息就消失了**；且刷新/切会话后彻底没有。现把 citations 以 JSON 存进 `messages.citations`，历史回看仍可溯源。改这块时注意：`add()` 与 `session_messages()` 都要带上该字段。
+26. **FastAPI 的 included router 不在 `app.routes` 顶层**：新版 FastAPI 用 `_IncludedRouter` 包装子路由，用 `[r.path for r in app.routes]` 检查会以为"路由没注册"（我据此误判过一次）。要确认路由请直接发请求或用 `/openapi.json`。
+27. **前端选择器别用 `main button` 这类模糊匹配**：页面上出现引用面板后，`main button` 命中的是面板折叠按钮而非"提问"按钮（浏览器实测时踩到）。用 `div.border-t button` 这类带结构特征的写法。
+28. **图谱存储的分工别搞反**：`knowledge_graph.json` 是**权威源**（用户要求保留以便 git diff），Neo4j 是**派生副本**。改了 json 或知识源后必须重跑同步（`python -m app.ingest.sync_graph`），否则出现"json 已更新、Neo4j 还是旧图"的静默不一致——kb 只读 Neo4j，不会发现 json 变了。
+29. **Neo4j 的两个坑**：① 不允许**空列表**作为属性值（关键词为空要存 None，读回再还原 `[]`，否则写入直接失败）；② id 形如 `KP_1000` 与 `KP_999` 的**字典序不等于数值序**，必须用 `seq` 属性排序才能还原 json 的节点顺序（顺序影响检索并列打破）。
+30. **同一函数里派生副本的失败策略要一致**：pipeline 里 Milvus 写入原本 try/except 警告后继续，而 Neo4j 同步直接失败——两者都是派生副本，已统一为**都显式失败**（json 已落盘，构建结果不会丢）。
+31. **改完 `kb.load()` 后留意变量名**：我曾用 `store = Neo4jGraphStore()` 覆盖了 `load(store=...)` 这个**注入 Milvus 向量库的参数**，导致测试注入失效（`test_kb` 抓到）。图存储请用 `graph_store` 之类的名字。
+32. **凭证只放一处**：服务账号密码集中在 `docker/.env`（不入库），compose 与应用共用；应用侧用 `python-dotenv`（`override=False, interpolate=False`）只填空缺、**不覆盖已有环境变量**、不展开 `$`。密码里应避免 `$`（compose 需 `$$` 转义，而 dotenv 按字面读取不还原）。注意由此带来的变化：应用的 MySQL 连接账号从 `root` 变成了 `.env` 里的 `vincent`（最小权限，已验证建表/读写/画像都够用）；想继续用 root 就把 `MYSQL_USER` 改回 root。
+33. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
 
 ---
 
@@ -388,7 +442,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 - **实体链接 + 图传播**：从 query 抽实体 → 图谱节点 → 影响力传播召回。
 - **评估完善**：可增加"测试集抽样"、`--limit` 随机采样、结果对比历史版本。
 - **新增法律**：把新法律 PDF 放入 `data/src/` → 重跑 pipeline；如需其在概念导航出现，需在 `concept_map.py` 补映射。若新法律也有"编/分编"层级或千位条号，先确认 `CN_NUM_CHARS`/`_PART_RE`/`_SUBPART_RE` 覆盖得住。
-- **旧记忆迁移**：`scripts/migrate_memory.py` 可把旧 `memory.db` 的会话迁入 MySQL（默认只预演，加 `--apply` 才写）。
+- **图数据库**：Neo4j（`neo4j:5.26.26`，7474 Browser / 7687 Bolt）已接入并成为检索读图来源；可选增强：把 `:RELATED` 拆成四种关系类型以支持更图原生的查询（会改变关系计数）。
 - **多用户/并发/异步**、**意图识别与兜底回答**、**图数据库存图谱**：见 README「后续优化功能」。
 
 ---
@@ -396,7 +450,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 ## 11. 验收/继续开发检查清单
 
 - [ ] Milvus 在跑：`docker ps` 见 `milvus-standalone`（宿主机端口 **19532**）
-- [ ] `uv run python -m pytest tests/ -v` → **140 passed**
+- [ ] `uv run python -m pytest tests/ -v` → **185 passed**
 - [ ] `uv run python -m app.ingest.pipeline` → **1465 知识点 / 21252 关联边** + `向量已写入 Milvus 集合 llm_wiki_laws：1465 条`
 - [ ] Milvus 条数核对：`MilvusVectorStore().count()` → 1465
 - [ ] `export API_KEY=... && uv run python -m app.cli` → 多轮问答正常（含民法典问题，如"高空抛物致人损害谁担责"应命中第一千二百五十四条）

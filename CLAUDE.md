@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 基于 Python 3.13+ 的劳动法知识问答系统（llm-wiki 理念，**非 RAG**），虚拟环境由本地 **uv** 管理。逻辑分两阶段：
 
+- **图谱存储**：`knowledge_graph.json` 是**权威源**（可 git diff）；pipeline 写完 json 后**同步到 Neo4j**，应用检索时从 Neo4j 读图。改了 json 就重跑 `uv run python -m app.ingest.sync_graph`（`--check-only` 只比对计数）。
 - **摄入（Ingest）**：把 PDF / `data/raw/*.md` 提前"编译"为结构化知识点（当前 **1465** 个，**每一条法条一个知识点**：劳动合同法 98 + 劳动法 107 + 民法典 1260）+ 关联图谱 `knowledge_graph.json`（**21252** 条边）+ Wiki 页面集 `wiki/`。
+- **Web 入口**：FastAPI（`app/api/`）提供注册登录 + 多会话 + SSE 流式问答，并**同源托管**前端构建产物（`web/dist`）；前端 React+Vite+Tailwind v4，深色墨蓝+金、法条正文衬线体。**不做容器化部署**（按用户决定）：本地 `uv run python -m app.api.main` + `cd web && npm run build`。
 - **查询（Query）**：先做**意图识别**（可答 / 法律未覆盖 / 无关，非"可答"直接兜底）→ 关键词(BM25) + 向量(bge-m3，存于 **Milvus**) 混合检索定位知识点 → 召回长期记忆（画像+相似历史，按 user_id 过滤）→ qwen-max 综合生成回答，记忆存 MySQL + Milvus。
 
 **为什么不是 RAG**：知识本体是 Markdown 页面 + JSON 图谱（可读、可审计、可随问答复利积累），向量仅参与查询时的召回融合；文档不做切块、向量不作为知识库载体。这一约束贯穿所有代码，改动前先想清楚。
@@ -19,20 +21,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync                                             # 安装/还原依赖（含 dev: pytest）
-uv run python -m app.ingest.pipeline                # 构建知识库：扫 data/src、data/raw，全量重建图谱+wiki（幂等）
+uv run python -m app.ingest.pipeline                # 构建知识库：全量重建图谱+wiki，并同步 Neo4j（幂等）
+uv run python -m app.ingest.sync_graph              # 只把 knowledge_graph.json 同步到 Neo4j（--check-only 只比对）
 uv run python -m app.cli                            # 命令行问答（需 export API_KEY 才有 LLM 生成，否则仅展示检索）
-uv run python -m pytest tests/ -v                   # 全部单元测试（当前 140 项）
+uv run python -m pytest tests/ -v                   # 全部单元测试（当前 185 项）
 uv run python -m pytest tests/test_retrieval.py -v  # 跑单个测试文件
 uv run python -m pytest tests/ -k "rrf or bfs" -v   # 按名称过滤
 uv run python -m eval.evaluate --limit 3            # 评估试跑 3 条
 uv run python -m eval.evaluate --skip-ragas         # 仅 recall@k（不调 LLM）
+cd web && npm run build && cd ..                    # 构建前端（产物由 FastAPI 托管）
+uv run python -m app.api.main                       # 启动 Web 服务（默认 :8080）
 ```
 
 **测试全部离线**：各测试文件自带假编码器（`tests/test_retrieval.py` 的 `StubEmbedder`、`tests/test_graph_build.py` 的 `FakeEmbedder`）与假向量库（`StubVectorStore`、`tests/test_milvus_store.py` 的 `FakeMilvusClient`）、mock LLM，不加载真实 bge-m3、不连 Milvus、不调 DashScope。只有 eval 与 CLI 生成才需要真实模型和 `API_KEY`。
 
 ## 架构（需跨文件才能看清的部分）
 
-代码按阶段分层在 `app/`：`ingest/`（构建）、`retrieval/`（混合检索）、`generation/`（生成）、`memory/`（MySQL 短期+画像 / Milvus 长期向量）；`kb.py` 是查询统一入口。
+代码按阶段分层在 `app/`：`ingest/`（构建）、`retrieval/`（混合检索）、`generation/`（生成）、`memory/`（MySQL 短期+画像 / Milvus 长期向量）、`api/`（FastAPI 认证+会话+SSE，托管 `web/` 前端）；`kb.py` 是查询统一入口，CLI 与 Web 共用同一条问答链路。
 
 **查询数据流**：`cli.py` 先做意图识别（`generation/intent.py`：可答 / 法律未覆盖 / 无关；**非"可答"直接兜底，不检索不生成**，但仍写记忆与日志）→ 把最近一问并入检索词（解"那/具体/继续"指代）→ `KnowledgeBase.search` → `HybridRetriever.search`：
 1. `keyword_retriever`：jieba 分词 + BM25Okapi，索引含标题/正文/**概念增强后关键词**（口语词可命中法条）；
@@ -69,7 +74,11 @@ crossref 是让"46条引38条/65条引39条"等被引用条文稳定进入生成
 ## 配置（单一来源）
 
 - **`app/config.py` 是唯一配置源**（历史上曾分工为"根 `config.py` 用户维护 + app 复用"，但根 `config.py` 已不存在、`app/config.py` 里那行复用是注释掉的，勿再按旧说法找它）。
-- 路径常量：`SRC_DIR`/`RAW_DIR`/`WIKI_DIR`/`GRAPH_PATH` 等（`MEMORY_DB_PATH` 仅作迁移脚本源路径，运行时不用）。
+- 路径常量：`SRC_DIR`/`RAW_DIR`/`WIKI_DIR`/`GRAPH_PATH` 等。
+- Web：`JWT_SECRET`（**生产必须用环境变量覆盖**）/`JWT_EXPIRE_DAYS`/`API_HOST`/`API_PORT`/`WEB_DIST_DIR`。
+- **服务凭证集中在 `docker/.env`**（MySQL/Neo4j/Redis/MinIO 的账号密码 + `JWT_SECRET`，不入库，模板 `docker/.env.example`）：
+  compose 与应用读同一份（应用侧用 `python-dotenv`，`override=False`：**不覆盖已有环境变量**；`interpolate=False`：不展开 `$`）。
+- 图数据库：`NEO4J_URI`/`NEO4J_USER`/`NEO4J_PASSWORD`/`NEO4J_DATABASE`（默认 `bolt://localhost:7687`）。
 - 记忆：`MYSQL_*`（**唯一后端，不做 SQLite 降级/失败回退**）、`MEMORY_COLLECTION`、`MEMORY_RECALL_K`、`MEMORY_INJECT_MODE`（`auto` 默认，仅追问时并入上一问）、`PROFILE_EXTRACT_EVERY`、`PROFILE_MODEL`。
 - 模型与大模型：`BGE_MODEL_PATH`（**机器相关的本地模型路径，换环境先改这里**；指向 Itcast 目录仅是用户提供的配置值，**不作为实现参考**）、`LLM_MODEL`、`DASHSCOPE_API_KEY`（读 `API_KEY` 环境变量）、`DASHSCOPE_BASE_URL`。
 - Milvus 向量库：`MILVUS_HOST`/`MILVUS_PORT`（默认 **19532**，是宿主机映射端口，容器内为 19530）/`MILVUS_COLLECTION`/`MILVUS_METRIC=COSINE`/`MILVUS_INDEX=HNSW`/`EMBED_DIM=1024`，均可用环境变量覆盖。
@@ -77,7 +86,7 @@ crossref 是让"46条引38条/65条引39条"等被引用条文稳定进入生成
 - 多跳链路：`RETRIEVAL_MODE`（`reflect` 默认 / `bfs` 对照）、`REFLECT_MODEL`（`qwen-turbo`）、`REFLECT_MAX_ROUNDS`（3）、`REFLECT_TIMEOUT_S`（15）。
 - 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（生成上下文最多 15 块）。
 
-数据新增/更换：把 PDF 放 `data/src/` 或 md 直接放 `data/raw/` 后重跑 pipeline 即自动并入（PDF→MD 增量、知识点合并重编号、图谱与 Wiki 全量重建、**向量全量重写 Milvus 并清理陈旧主键**）。想让概念出现在"核心概念导航"（`wiki/index.md`），需在 `ingest/concept_map.py` 补映射；Wiki 页面落盘在 `ingest/wiki_writer.py`。**改知识源后必须重跑 pipeline**——向量库不会自己发现知识库变了（旧 `.npy` 缓存曾因此静默残留 205 行对着 1238 节点）。
+数据新增/更换：把 PDF 放 `data/src/` 或 md 直接放 `data/raw/` 后重跑 pipeline 即自动并入（含同步 Neo4j 与 Milvus）（PDF→MD 增量、知识点合并重编号、图谱与 Wiki 全量重建、**向量全量重写 Milvus 并清理陈旧主键**）。想让概念出现在"核心概念导航"（`wiki/index.md`），需在 `ingest/concept_map.py` 补映射；Wiki 页面落盘在 `ingest/wiki_writer.py`。**改知识源后必须重跑 pipeline**——向量库不会自己发现知识库变了（旧 `.npy` 缓存曾因此静默残留 205 行对着 1238 节点）。
 
 ## 关键版本约束（勿随意改）
 

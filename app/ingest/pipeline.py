@@ -15,6 +15,7 @@ from app.ingest.concept_map import enrich_keywords
 from app.ingest.graph_build import build_graph, save_graph, semantic_text
 from app.ingest.knowledge_extract import KnowledgePoint, extract_knowledge_points
 from app.ingest.pdf_to_markdown import pdf_to_markdown
+from app.ingest.sync_graph import sync_from_json
 from app.ingest.wiki_writer import write_wiki
 from app.retrieval.embedder import Embedder
 from app.retrieval.vector_store import MilvusVectorStore
@@ -80,18 +81,21 @@ def run_pipeline(use_semantic: bool = True, verbose: bool = True) -> dict:
         vectors = embedder.encode([semantic_text(p) for p in points])
 
     graph = build_graph(points, embedder=embedder, vectors=vectors)
-    save_graph(graph, GRAPH_PATH)
+    save_graph(graph, GRAPH_PATH)          # 权威源（可 git diff）
+
+    # 同步到 Neo4j 图数据库副本（应用检索时从 Neo4j 读图）。
+    # json 已落盘，故同步失败不会丢构建结果；但必须**显式失败**而不是静默跳过，
+    # 否则会出现"json 已更新、Neo4j 还是旧图"的静默不一致。
+    sync_from_json(GRAPH_PATH, verbose=verbose)
 
     if vectors is not None:
-        try:
-            store = MilvusVectorStore()
-            store.ensure_collection()
-            written = store.upsert(graph["nodes"], vectors)
-            if verbose:
-                print(f"[pipeline] 向量已写入 Milvus 集合 {store.collection}：{written} 条")
-        except Exception as exc:   # 图谱与 Wiki 已落盘，不因向量库故障丢弃本次构建
-            print(f"[pipeline] 警告：向量写入 Milvus 失败（{exc}）——"
-                  f"图谱与 Wiki 已生成，但向量检索将不可用或是旧数据")
+        # 与 Neo4j 同步一致：派生副本写入失败就**显式失败**（json 已落盘，构建结果不会丢）。
+        # 静默跳过会留下"json 已更新、向量库仍是旧数据"的不一致。
+        store = MilvusVectorStore()
+        store.ensure_collection()
+        written = store.upsert(graph["nodes"], vectors)
+        if verbose:
+            print(f"[pipeline] 向量已写入 Milvus 集合 {store.collection}：{written} 条")
 
     write_wiki(points, graph)
     if verbose:

@@ -4,13 +4,19 @@ version = "1.0"
 description = "这是一个法律知识问答系统，主要提供劳动法等法律咨询"
 requires-python = ">=3.13"
 dependencies = [
+    "bcrypt>=5.0.0",
+    "fastapi>=0.141.1",
     "jieba>=0.42.1",
     "markitdown[pdf]>=0.1.7",
+    "neo4j>=6.3.0",
     "openai>=2.53.0",
+    "pyjwt>=2.14.0",
     "pymilvus>=2.5,<2.6",
     "pymysql>=1.2.0",
+    "python-dotenv>=1.2.2",
     "rank-bm25>=0.2.2",
     "sentence-transformers>=5.7.0",
+    "uvicorn>=0.52.4",
 ]
 
 [dependency-groups]

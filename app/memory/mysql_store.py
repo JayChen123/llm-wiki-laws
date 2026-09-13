@@ -25,6 +25,7 @@ _TABLE_DDL = [
     """CREATE TABLE IF NOT EXISTS users (
             user_id VARCHAR(64) PRIMARY KEY,
             display_name VARCHAR(128),
+            password_hash VARCHAR(128),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
     """CREATE TABLE IF NOT EXISTS sessions (
             session_id VARCHAR(64) PRIMARY KEY,
@@ -38,6 +39,7 @@ _TABLE_DDL = [
             user_id VARCHAR(64),
             role VARCHAR(16),
             content MEDIUMTEXT,
+            citations MEDIUMTEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_messages_session (session_id, id),
             INDEX idx_messages_user (user_id))""",
@@ -79,6 +81,14 @@ class MySQLMemoryStore:
         cursor = self.conn.cursor()
         for ddl in _TABLE_DDL:
             cursor.execute(ddl)
+        # 老库补列（幂等）：users.password_hash（P4 登录）、messages.citations（引用溯源）
+        for table, column, ddl in (
+                ("users", "password_hash", "ALTER TABLE users ADD COLUMN password_hash VARCHAR(128)"),
+                ("messages", "citations", "ALTER TABLE messages ADD COLUMN citations MEDIUMTEXT"),
+        ):
+            existing = {row[0] for row in self._run(f"SHOW COLUMNS FROM {table}")}
+            if column not in existing:
+                cursor.execute(ddl)
         self.conn.commit()
 
     def _run(self, sql: str, params: tuple = ()) -> list[tuple]:
@@ -103,12 +113,91 @@ class MySQLMemoryStore:
             (session, user_id),
         )
 
+    # ---------- 账号（P4 注册登录） ----------
+
+    def create_user(self, user_id: str, password_hash: str,
+                    display_name: str | None = None) -> bool:
+        """创建账号；用户名已存在返回 False（唯一约束冲突）。"""
+        try:
+            self._run(
+                "INSERT INTO users(user_id, display_name, password_hash) VALUES(%s, %s, %s)",
+                (user_id, display_name or user_id, password_hash),
+            )
+            return True
+        except Exception as exc:
+            import pymysql
+            if isinstance(exc, pymysql.err.IntegrityError):
+                return False
+            raise
+
+    def get_user(self, user_id: str) -> dict | None:
+        """按用户名取账号（含 password_hash，供登录校验）。"""
+        rows = self._run(
+            "SELECT user_id, display_name, password_hash FROM users WHERE user_id=%s",
+            (user_id,),
+        )
+        if not rows:
+            return None
+        return {"user_id": rows[0][0], "display_name": rows[0][1], "password_hash": rows[0][2]}
+
+    # ---------- 会话（Web 端多会话） ----------
+
+    def list_sessions(self, user_id: str) -> list[dict]:
+        """该用户的会话列表（最近更新的在前），带消息数。"""
+        rows = self._run(
+            "SELECT s.session_id, s.created_at,"
+            "  (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.session_id) AS n "
+            "FROM sessions s WHERE s.user_id=%s ORDER BY s.created_at DESC, s.session_id DESC",
+            (user_id,),
+        )
+        return [{"session_id": r[0], "created_at": str(r[1]), "message_count": int(r[2])}
+                for r in rows]
+
+    def session_belongs_to(self, session: str, user_id: str) -> bool:
+        """会话归属校验——**越权防护的关键**：别人的会话一律当作不存在。"""
+        rows = self._run(
+            "SELECT 1 FROM sessions WHERE session_id=%s AND user_id=%s",
+            (session, user_id),
+        )
+        return bool(rows)
+
+    def session_messages(self, session: str, limit: int = 200) -> list[dict]:
+        """会话历史消息（旧→新），带引用来源，用于前端渲染历史与溯源。"""
+        import json as _json
+        rows = self._run(
+            "SELECT role, content, created_at, citations FROM messages WHERE session_id=%s "
+            "ORDER BY id LIMIT %s",
+            (session, int(limit)),
+        )
+        out: list[dict] = []
+        for role, content, created_at, citations in rows:
+            try:
+                parsed = _json.loads(citations) if citations else []
+            except (TypeError, ValueError):
+                parsed = []
+            out.append({"role": role, "content": content, "created_at": str(created_at),
+                        "citations": parsed})
+        return out
+
+    def delete_session(self, session: str) -> None:
+        """删除会话及其消息（记忆向量的清理由调用方负责）。
+
+        会话标题不单独存列：前端取该会话首条用户提问作为标题，避免再维护一处冗余状态。
+        """
+        self._run("DELETE FROM messages WHERE session_id=%s", (session,))
+        self._run("DELETE FROM sessions WHERE session_id=%s", (session,))
+
     # ---------- 消息 ----------
 
-    def add(self, session: str, role: str, content: str, user_id: str = "") -> None:
+    def add(self, session: str, role: str, content: str, user_id: str = "",
+            citations=None) -> None:
+        """写入一条消息；assistant 消息可带引用来源（供前端做溯源展示）。"""
+        import json as _json
+        payload = _json.dumps(citations, ensure_ascii=False) if citations else None
         self._run(
-            "INSERT INTO messages(session_id, user_id, role, content) VALUES(%s, %s, %s, %s)",
-            (session, user_id, role, content),
+            "INSERT INTO messages(session_id, user_id, role, content, citations) "
+            "VALUES(%s, %s, %s, %s, %s)",
+            (session, user_id, role, content, payload),
         )
 
     def recent(self, session: str, limit: int | None = None) -> list[dict]:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -161,8 +162,9 @@ def build_graph(
 
 
 def save_graph(graph: dict, path=GRAPH_PATH) -> None:
-    path.write_text(json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 允许传 str（如 argparse 的 --file），避免调用方因类型不同而踩 AttributeError
+    Path(path).write_text(json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_graph(path=GRAPH_PATH) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(Path(path).read_text(encoding="utf-8"))

@@ -1,15 +1,17 @@
 # llm-wiki 法律知识问答系统
 
-基于 **llm-wiki** 理念构建的**法律知识问答系统**，提供**命令行交互式问答**。系统将《中华人民共和国劳动法》《中华人民共和国劳动合同法》《中华人民共和国民法典》PDF
+基于 **llm-wiki** 理念构建的**法律知识问答系统**，提供**Web 界面**（多用户注册登录）与**命令行**两种入口。系统将《中华人民共和国劳动法》《中华人民共和国劳动合同法》《中华人民共和国民法典》PDF
 提前"编译"为结构化的**知识点图谱**，查询时通过 **关键词（BM25）+ 向量（bge-m3）混合检索**定位知识点，再由大模型 `qwen-max`
 综合生成回答，并带**短期记忆**支持多轮对话。
 
-> 本项目**不是 RAG 系统**：不对文档切块、不把向量作为知识库存储载体。知识库本体是结构化 Wiki 页面 + 关联图谱，向量检索仅作为混合召回手段之一。
+> 本项目**不是 RAG 系统**：不对文档切块、不把向量作为知识库存储载体。知识库本体是结构化 Wiki 页面 + 关联图谱
+> （`knowledge_graph.json` 为权威源，另同步一份到 Neo4j 供图查询），向量检索仅作为混合召回手段之一。
 
 ---
 
 ## 一、核心特性
 
+- **Web 界面（多用户）**：注册/登录（bcrypt + JWT HttpOnly Cookie）、多会话管理与历史切换、**流式打字机**回答、**引用溯源面板**（列出命中的知识点、法律名、分数与原文行号）；深色科技墨蓝 + 金色点缀、法条正文用衬线体。前端构建产物由 FastAPI **同源托管**（无 CORS/CSRF 配置负担）。
 - **意图识别与兜底**：问答前先分类为「可答 / 法律相关但本库未覆盖 / 与法律无关」，后两类直接给兜底话术（说明本库覆盖范围 + 可问示例），**不检索也不生成**；分类器超时或异常时保守放行，不阻断正常问答。
 - **llm-wiki 知识编译**：摄入时把 PDF 编译为知识点 + 关联图谱，查询时只做"定位 + 综合"，知识与答案随时间复利积累。
 - **非 RAG 知识库**：不切块、不向量化存储；知识库是 `wiki/` 下的 Markdown 页面集 + `knowledge_graph.json`
@@ -20,6 +22,8 @@
   *RRF（Reciprocal Rank Fusion）** 融合排序，并沿关联边扩展相关知识点。
 - **多跳推理（反思式）**：图谱四类边（结构/关键词/语义/法条交叉引用）扩展出基础上下文后，由 **LLM 反思**自主决定是否继续沿**引用关系**深挖——判"已充分"就停、判"需要补"则只从**候选白名单**里挑被引条文（防幻觉）；无引用关系时**不调用 LLM 直接停止**。轮数上限 3，失败即停（fail-closed）。
 - **两条链路可切换**：`RETRIEVAL_MODE=reflect`（默认，= 图谱扩展 + 反思补取，上下文是 bfs 的超集）/ `bfs`（原固定深度扩展，保留用于 A/B 对比与回退）。
+- **图数据库（Neo4j）**：图谱同步到 Neo4j，**四类边拆成四种关系类型**（`:SIBLING`/`:KEYWORD`/`:SEMANTIC`/`:CROSSREF`，共 30569 条关系），其中 `:CROSSREF` 的**引用方向在同步时从正文派生**，可直接做有向引用链遍历；应用检索时从图数据库读图；
+  `knowledge_graph.json` 仍是**权威源**（可 git diff、可审计），改动后跑 `python -m app.ingest.sync_graph` 即让 Neo4j 与之一致。
 - **概念导航**：`wiki/index.md` 提供"核心概念导航"，把"试用期/竞业限制/加班费/劳务派遣…"等法律概念链接到具体法条页。
 - **双层记忆**：**短期**=会话消息（**MySQL** `messages`），按需注入检索词（只在"像追问"时才并入上一问，见下）与生成历史；**长期**=用户画像（MySQL `user_profile`）与历史问答语义索引（**Milvus** `llm_wiki_user_memory`），新问题先按 `user_id` 过滤召回该用户的相关记忆，作为"用户背景"注入生成（**不得作为法律依据**）。画像用 qwen-turbo **低频抽取**（默认每 5 轮），历史记忆用本地 bge-m3 编码（零 API 成本）。
 - **记忆只有 MySQL/Milvus 一套后端**：不做 SQLite 降级、不做连接失败回退——连不上就直接报错，避免数据分散或"以为在写 MySQL 其实在写本地文件"。
@@ -30,62 +34,96 @@
 
 ### 后续优化功能
 
-- 前端页面系统，支持多用户注册登录
-- 用户记忆模块优化，采用长期和短期记忆相结合的方式
 - 系统改为异步过程，增加系统的并发能力
 - 系统压力测试
-- docker 部署
-- wiki的知识图谱存储，考虑用图数据库存储和检索
+- 知识库更新（新增法律时重跑 pipeline；概念导航需在 `concept_map.py` 补映射）
+
+> 已完成并移入上方「核心特性」：前端页面与多用户注册登录、长期+短期双层记忆、SQLite → MySQL、
+> 智能体自主多跳检索、意图识别与兜底、知识图谱存入 Neo4j（图数据库）。
+
 ---
 
 ## 二、技术架构
 
+> 一句话：**摄入时把法律「编译」成知识点 + 关联图谱（知识本体是文件与图谱，不是向量）；
+> 查询时先判意图，再混合检索定位知识点、沿引用关系反思式多跳，最后带着用户记忆生成。**
+
 ```
-┌──────────────────────────────  知识构建管线（Ingest）  ──────────────────────────────┐
-│                                                                                      │
-│  data/src/中华人民共和国劳动合同法.pdf + 中华人民共和国劳动法.pdf + 中华人民共和国民法典.pdf │
-│        │  markitdown（微软）                                                          │
-│        ▼                                                                             │
-│  data/raw/*.md  ──► 清洗（页眉/页码/裸域名/康熙部首变体） ──► 按"编→章→节→条"切分        │
-│                                                                                      │
-│  知识点 KnowledgePoint（1465 个）                                                      │
-│     · id / 标题 / 编 / 章节 / 条文 / 正文 / 关键词 / 来源行号                            │
-│        │                                                                             │
-│        ├─► 概念关键词增强（concept_map：加班费→劳动法第四十四条 等，53 个概念）           │
-│        ├─► 关联图谱构建（四类边）                                                      │
-│        │       · sibling   同（编,章）内条文的结构关系                                  │
-│        │       · keyword   关键词重合（Jaccard 相似度）                                │
-│        │       · semantic  bge-m3 语义相似度（余弦 ≥0.75）                             │
-│        │       · crossref  正文"第X条"交叉引用（权重1.5，跨法不加）                     │
-│        │       输出 knowledge_graph.json（21252 条边）                                 │
-│        ├─► 向量写入 Milvus（HNSW + COSINE，dim 1024；全量对齐 + 清理陈旧主键）           │
-│        └─► Wiki 页面集落盘                                                            │
-│              · wiki/index.md（核心概念导航 + 按源文档分组；有编时按 编→章 两级）          │
-│              · wiki/concepts/KP_*.md（每知识点一页，含双向链接 [[]]）                   │
-│              · wiki/log.md（操作日志）                                                 │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-                                    │  query
-                                    ▼
-┌──────────────────────────────  检索问答（Query）  ─────────────────────────────────┐
-│                                                                                      │
-│  用户问题 → 意图识别（可答 / 法律未覆盖 / 无关，后两类直接兜底返回）                      │
-│        │  + 短期记忆按需注入（像追问才并入上一问）                                       │
-│        ▼                                                                             │
-│        ├─► 关键词检索：jieba 分词 + BM25（含概念关键词）─┐                              │
-│        └─► 向量检索：bge-m3 编码 → Milvus 余弦检索 ─┼─► RRF 融合排序 ─► Top-K 种子     │
-│                                               │                                      │
-│        ┌──────────────────────────────────────┘                                      │
-│        ▼                                                                             │
-│  基础图谱扩展（≤3跳，四类边）→ 反思循环（≤3轮，LLM 决定是否沿引用继续深挖/是否已充分）    │
-│        ↓ 长期记忆召回（按 user_id 过滤：画像 + 相似历史）→ 作为"用户背景"注入生成          │
-│        │                                                                             │
-│        ▼                                                                             │
-│  qwen-max（DashScope OpenAI 兼容接口）综合生成                                         │
-│        │   + 短期记忆历史（最近 N 轮）+ 法律名上下文标题                                │
-│        ▼                                                                             │
-│  回答（带引用）→ 写短期记忆（MySQL messages）+ 长期记忆（Milvus 历史语义索引）            │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+┌─ ① 入口层（两个入口共用同一条问答链路） ───────────────────────────────────────────┐
+│浏览器（React 19 + Vite + Tailwind v4）：注册/登录 · 多会话 · 流式回答 · 引用溯源   │
+│        │  HTTP + SSE（HttpOnly Cookie 认证；前端与 API 同源，免 CORS/CSRF）        │
+│        ▼                                                                           │
+│FastAPI（app/api/）：认证 · 会话 CRUD · SSE 问答 · 同源托管前端构建产物             │
+│        │                                                                           │
+│CLI（app/cli.py）────────────────┘  同一链路，区别只在「用户身份」来源              │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ ② 知识构建管线（Ingest · 离线，pipeline 幂等重建） ───────────────────────────────┐
+│data/src/*.pdf ──markitdown（增量）──► data/raw/*.md                                │
+│                                     │                                              │
+│   清洗（页眉日期/页码/裸域名/康熙部首变体/换页符行号）                             │
+│                                     ▼                                              │
+│   按「编 → 章 → 节 → 条」切分 ──► KnowledgePoint × 1465（每条法条一个知识点）      │
+│                                     │                                              │
+│   ├─► 概念关键词增强（concept_map 53 个概念：加班费 → 劳动法第四十四条 …）         │
+│   ├─► 图谱 knowledge_graph.json（权威源，21252 条边，可 git diff）                 │
+│   │      sibling 同(编,章) │ keyword Jaccard≥0.3 │ semantic 余弦≥0.75              │
+│   │      crossref 正文「第X条」引用（权重 1.5，仅同法内）                          │
+│   │      └─► 同步 ──► Neo4j 图数据库（应用检索时从这里读图）                       │
+│   ├─► 向量 → Milvus llm_wiki_laws（dim1024 · HNSW+COSINE · 全量对齐+清理陈旧）     │
+│   └─► Wiki 页面集 wiki/（index.md 概念导航 + 1465 个知识点页 + log.md）            │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ ③ 问答链路（Query · 在线） ───────────────────────────────────────────────────────┐
+│用户问题（已登录身份 user_id）                                                      │
+│        │                                                                           │
+│        ▼                                                                           │
+│意图识别（qwen-turbo 三分类）                                                       │
+│   ├─ 与法律无关 / 本库未覆盖 ──► 兜底话术（不检索不生成，仍写记忆与日志）          │
+│   └─ 可答 ──► 短期记忆按需注入检索词（仅「像追问」时并入上一问，避免串题）         │
+│        │                                                                           │
+│        ▼                                                                           │
+│双路召回 → RRF 融合（图谱节点与边均来自 Neo4j）                                     │
+│   · 关键词：jieba + BM25（索引含概念关键词）                                       │
+│   · 向量  ：bge-m3 → Milvus 余弦检索                                               │
+│   → Σ 1/(60+rank) 融合排序 → Top-K = 10 个种子                                     │
+│        │                                                                           │
+│        ▼                                                                           │
+│基础图谱扩展（≤3 跳，四类边，补 EXPAND_K=5）                                        │
+│   └─► 反思循环（≤3 轮）：候选 = 被引条文白名单                                     │
+│         无引用关系 → 不调 LLM 直接停；有则判「已充分 / 该补哪几条」；失败即停      │
+│        │                                                                           │
+│        ▼                                                                           │
+│长期记忆召回（强制按 user_id 过滤）                                                 │
+│   画像（MySQL user_profile）+ 相似历史（Milvus llm_wiki_user_memory）              │
+│   └─► 作为「用户背景」注入生成（标注不得作为法律依据；绝不并入检索词）             │
+│        │                                                                           │
+│        ▼                                                                           │
+│生成：qwen-max 流式（标题带法律名防跨法同条号混淆 + 多跳引导 + 列出引用）           │
+│        │                                                                           │
+│        ▼                                                                           │
+│落库：MySQL messages（含 citations）+ Milvus 用户记忆 + logs/qa.log                 │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ ④ 存储分工 ───────────────────────────────────────────────────────────────────────┐
+│Neo4j  图数据库（查询副本）：节点 + 四类关系（SIBLING/KEYWORD/SEMANTIC/CROSSREF）   │
+│Milvus 向量（非知识载体）：llm_wiki_laws 法律向量 │ llm_wiki_user_memory 用户记忆   │
+│MySQL  记忆唯一后端：users · sessions · messages(含 citations) · user_profile       │
+│文件   权威源（人读/可审计/可 git diff）：knowledge_graph.json 图谱 │ wiki/ 页面集  │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**两条链路的分工**
+
+| | 摄入（Ingest） | 查询（Query） |
+|---|---|---|
+| 何时跑 | 离线；数据变更后重跑 `app.ingest.pipeline`（幂等全量重建） | 每次提问；Web 与 CLI 共用 |
+| 输入 | `data/src/*.pdf`、`data/raw/*.md` | 用户问题（+ 会话历史 + 用户记忆） |
+| 产出 | `knowledge_graph.json`（权威源）、**同步到 Neo4j**（四类关系）、`wiki/` 页面集、Milvus 法律向量 | 带引用的回答；写回短期与长期记忆 |
+
+**为什么不是 RAG**：文档不在查询时切块、向量不作为知识载体。知识本体是 `wiki/concepts/*.md`
+（1465 页，每页一条法条）与 `knowledge_graph.json`（21252 条关联边），可直接用上下文窗口承载、
+可读可审计；Neo4j 与 Milvus 都是**派生副本**（前者存图、后者存向量），不是知识本体。
 
 ---
 
@@ -95,7 +133,7 @@
 llm_wiki_laws/
 ├── pyproject.toml                # 依赖与元数据（uv 管理）
 ├── docker/
-│   └── docker-compose.yml        # Milvus v2.4.4 + etcd/minio，另有 redis/mysql（端口见文件）
+│   └── docker-compose.yml        # Milvus v2.4.4 + etcd/minio + redis/mysql + neo4j（端口见文件）
 ├── data/
 │   ├── src/                        # 原始 PDF 源文件（只读，可新增）
 │   │   ├── 中华人民共和国劳动合同法.pdf
@@ -105,8 +143,19 @@ llm_wiki_laws/
 │       ├── 中华人民共和国劳动合同法.md
 │       ├── 中华人民共和国民法典.md
 │       └── 中华人民共和国劳动法_中华人民共和国人力资源和社会保障部.md
+├── web/                          # 前端（React + Vite + Tailwind v4）
+│   ├── src/api.js                #   API 层：fetch + 手动解析 POST 的 SSE
+│   ├── src/pages/                #   AuthPage（登录注册）/ ChatPage（问答主界面）
+│   ├── src/components/           #   SessionList / MessageList / CitationPanel / Composer
+│   └── dist/                     #   构建产物（由 FastAPI 托管）
 ├── app/
-│   ├── config.py                 # 应用配置（**唯一配置源**：路径、bge-m3、LLM、Milvus、检索参数）
+│   ├── api/                      # ⑤ Web API（FastAPI）
+│   │   ├── main.py               #   应用入口 + 托管前端产物（SPA 回退）
+│   │   ├── auth.py               #   bcrypt 密码 + JWT(HttpOnly Cookie)
+│   │   ├── deps.py               #   依赖注入（当前用户/KB/记忆/生成器，测试可替换）
+│   │   ├── routes_auth.py        #   注册/登录/登出/当前用户
+│   │   └── routes_chat.py        #   会话 CRUD + SSE 流式问答
+│   ├── config.py                 # 应用配置（**唯一配置源**：路径、bge-m3、LLM、Milvus、MySQL、检索参数）
 │   ├── kb.py                     # 知识库加载与统一检索入口
 │   ├── cli.py                    # 命令行交互式问答（含短期记忆 + 日志）
 │   ├── logger.py                 # 结构化问答日志（滚动写入 logs/qa.log）
@@ -115,6 +164,8 @@ llm_wiki_laws/
 │   │   ├── knowledge_extract.py  #    清洗 + 编/章/节/条解析 + 知识点提取 + 关键词
 │   │   ├── concept_map.py        #    法律概念→条文映射 + 关键词增强
 │   │   ├── graph_build.py        #    关联图谱构建（sibling/keyword/semantic/crossref）
+│   │   ├── graph_store.py        #    图谱的 Neo4j 读写（四类关系拆分、全量对齐、批量 UNWIND、seq 排序）
+│   │   ├── sync_graph.py         #    knowledge_graph.json → Neo4j 同步入口（含 --check-only）
 │   │   ├── wiki_writer.py        #    Wiki 页面集落盘（index 含核心概念导航）
 │   │   └── pipeline.py           #    管线入口
 │   ├── retrieval/                # ② 混合检索
@@ -136,7 +187,7 @@ llm_wiki_laws/
 │   ├── index.md
 │   ├── log.md
 │   └── concepts/KP_*.md          # 1465 个知识点页面
-├── knowledge_graph.json          # 知识点关联图谱（节点 + 带类型边）
+├── knowledge_graph.json          # 知识点关联图谱（**权威源**，节点 + 带类型边；Neo4j 由它同步）
 ├── logs/
 │   └── qa.log                    # 问答日志（滚动，JSON 事件流）
 ├── eval/                         # 评估
@@ -144,8 +195,7 @@ llm_wiki_laws/
 │   ├── metrics.py                #   recall@1/3/5/8 检索指标（自定义）
 │   ├── evaluate.py               #   评估主程序（recall@k + ragas）
 │   └── results/                  #   评估结果输出
-├── scripts/migrate_memory.py      # memory.db → MySQL 一次性迁移（默认不执行）
-├── tests/                        # 单元测试（pytest，140 项）
+├── tests/                        # 单元测试（pytest，185 项）
 └── README.md
 ```
 
@@ -199,12 +249,24 @@ llm_wiki_laws/
 
 ---
 
-## 六、短期记忆（轻量）
+## 六、双层记忆
 
-- **存储**：MySQL 表 `users` / `sessions` / `messages`（utf8mb4），无本地文件依赖。
-- **注入检索**：`recent_user_queries()` 取最近 1 问并入检索词，解决指代与话题延续。
-- **注入生成**：`recent()` 取最近 10 条消息作为 LLM 对话历史，保证多轮连贯。
-- **会话管理**：CLI 可指定会话 ID，重开后可续聊上次对话；`/clear` 一键清空。
+**短期（会话内）** —— MySQL 表 `users` / `sessions` / `messages`（utf8mb4），无本地文件依赖：
+
+- **按需注入检索**：只有当前问题"像追问"（含指代词，或很短且不含法律实体词）时，才把上一问并入检索词
+  （`MEMORY_INJECT_MODE=auto`，可设 `always` / `off`）。**这修掉了换话题时的串题污染**：
+  此前无条件并入，导致"先问劳务派遣、再问试用期"会混入劳务派遣条文。
+- **注入生成**：取最近 10 条消息作为 LLM 对话历史，保证多轮连贯。
+- **会话管理**：Web 端多会话切换 / 新建 / 删除；CLI 可指定会话 ID 重开续聊；`/clear` 清空当前会话。
+
+**长期（跨会话）** —— 画像存 MySQL `user_profile`，历史问答语义索引存 Milvus `llm_wiki_user_memory`：
+
+- **写入**：每个轮次把"问题 + 回答要点"写入 Milvus —— 用**本地 bge-m3 编码，零 API 成本**，
+  且**不额外调 LLM**；画像由 `qwen-turbo` **每 5 轮抽一次**（只抽跨会话仍有用的用户事实，排除敏感信息）。
+- **召回**：提问时**强制按 `user_id` 过滤**召回（画像 + 相似历史），作为「用户背景」注入生成，
+  并显式标注**不得作为法律依据**；**绝不并入检索词**——记忆不是法律知识，并入会重演串题污染。
+- **清除**：删除会话时连带清空该用户的长期记忆（避免已删内容仍被召回）。
+- **不做降级**：记忆只有 MySQL/Milvus 一套后端，连不上直接报错，不静默退回本地文件。
 
 ---
 
@@ -245,12 +307,34 @@ grep '"user_id": "user001"' logs/qa.log        # 某用户的问答记录
 uv sync                     # 安装依赖（含 dev: pytest）
 ```
 
-### 启动 Milvus
+### 配置服务凭证（一次性）
 
 ```bash
-cd docker && docker compose up -d      # 启动 Milvus（宿主机端口 19532）等容器
-docker ps                              # 确认 milvus-standalone 在跑
+cd docker && cp .env.example .env      # 填 MySQL / Neo4j / Redis / MinIO 的账号密码 + JWT_SECRET
 ```
+
+**账号密码集中在 `docker/.env`**：docker compose 自动读取它，应用（`uv run ...`）也读同一份，
+所以改一处即可让容器与应用一致。该文件不入库（`.gitignore` 已忽略），模板是 `docker/.env.example`。
+若密码里含 `$`，compose 需写成 `$$`。环境变量优先于 `.env`（容器化/CI 里可继续用导出变量覆盖）。
+
+### 启动依赖服务
+
+```bash
+cd docker && docker compose up -d      # Milvus（19532）+ MySQL（3308）+ Neo4j（7474/7687）+ Redis
+docker ps                              # 确认都在跑
+```
+
+### 启动 Web 服务（多用户注册登录）
+
+```bash
+cd web && npm run build && cd ..      # 构建前端（产物 web/dist 由 FastAPI 同源托管）
+uv run python -m app.api.main         # 打开 http://localhost:8080
+```
+
+- 前端开发模式：`cd web && npm run dev`（已配 `/api` 代理到 8080）
+- 冒烟自检：服务起来后跑 `scripts/smoke_api.sh`（注册→建会话→流式问答→引用持久化→登出）
+- **JWT_SECRET**：生产环境务必用环境变量覆盖（默认值仅供本地开发）
+- 记忆与向量依赖 MySQL（3308）与 Milvus（19532），需先 `cd docker && docker compose up -d` 启动这两个服务
 
 ### 构建知识库
 
@@ -258,8 +342,15 @@ docker ps                              # 确认 milvus-standalone 在跑
 uv run python -m app.ingest.pipeline
 ```
 
-首次构建会自动完成 PDF→MD→知识点→图谱→Wiki 落盘，加载 bge-m3 编码语义向量并**写入 Milvus**（集合 `llm_wiki_laws`）。
-**改了知识源（PDF/md）后必须重跑 pipeline** —— 向量库不会自己发现知识库变了。
+首次构建会自动完成 PDF→MD→知识点→图谱→Wiki 落盘，加载 bge-m3 编码语义向量并**写入 Milvus**（集合 `llm_wiki_laws`），
+最后把图谱**同步到 Neo4j**。**改了知识源（PDF/md）后必须重跑 pipeline** —— 派生副本不会自己发现知识库变了。
+
+若只改了 `knowledge_graph.json`（或想重新对齐副本），单独跑同步即可：
+
+```bash
+uv run python -m app.ingest.sync_graph              # json → Neo4j
+uv run python -m app.ingest.sync_graph --check-only # 只比对两侧计数是否一致
+```
 
 ### 启动问答
 
@@ -291,6 +382,10 @@ uv run python -m pytest tests/ -v
 | `MILVUS_HOST` / `MILVUS_PORT`  | `app/config.py`             | Milvus 地址（默认 `localhost:19532`，宿主机映射端口，容器内为 19530）                  |
 | `MILVUS_COLLECTION`            | `app/config.py`             | 向量集合名（默认 `llm_wiki_laws`）                                           |
 | `MILVUS_METRIC` / `MILVUS_INDEX` | `app/config.py`           | 度量（COSINE）/ 索引（HNSW）                                                 |
+| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | `docker/.env` → `app/config.py` | 图数据库连接（默认 `bolt://localhost:7687`） |
+| `JWT_SECRET`                   | `docker/.env` → `app/config.py` | 令牌密钥（**生产必须改**） |
+| **服务凭证**（MySQL/Neo4j/Redis/MinIO） | `docker/.env`        | **账号密码集中在这里**：compose 与应用读同一份，改一处即可；文件不入库，模板见 `docker/.env.example` |
+| `NEO4J_DATABASE`               | `app/config.py`             | Neo4j 数据库名（默认 `neo4j`）                                              |
 | `INTENT_ENABLED`               | `app/config.py`             | 是否启用意图识别（默认开）                                                       |
 | `INTENT_MODEL`                 | `app/config.py`             | 意图分类用的轻量模型（默认 `qwen-turbo`）                                          |
 | `INTENT_TIMEOUT_S`             | `app/config.py`             | 分类超时秒数（默认 3），超时即保守放行                                                |
@@ -307,6 +402,8 @@ uv run python -m pytest tests/ -v
 | `MEMORY_RECALL_K`              | `app/config.py`             | 每次注入生成的记忆条数（默认 3）                                                   |
 | `MEMORY_INJECT_MODE`           | `app/config.py`             | 检索词注入策略：`auto`（默认，仅追问时并入上一问）/ `always` / `off`                        |
 | `PROFILE_EXTRACT_EVERY`        | `app/config.py`             | 每 N 轮抽一次画像（默认 5；0=关闭）                                              |
+| `JWT_SECRET` / `JWT_EXPIRE_DAYS` | `app/config.py`           | 令牌密钥（**生产必须用环境变量覆盖**）/ 有效期天数（默认 7）                                 |
+| `API_HOST` / `API_PORT`        | `app/config.py`             | Web 服务监听地址（默认 `0.0.0.0:8080`）                                        |
 | 关联阈值                           | `app/ingest/graph_build.py` | `keyword_threshold=0.3`、`semantic_threshold=0.75`、`crossref` 权重 1.5 |
 | 概念映射                           | `app/ingest/concept_map.py` | 法律概念→条文映射与用户查询词（可编辑扩充）                                              |
 
@@ -316,7 +413,7 @@ uv run python -m pytest tests/ -v
 
 ## 十、测试
 
-`tests/`（**140 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
+`tests/`（**185 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
 
 | 测试文件                        | 覆盖范围                                                              |
 |-----------------------------|-------------------------------------------------------------------|
@@ -332,6 +429,9 @@ uv run python -m pytest tests/ -v
 | `test_reflective_retriever.py` | 停止条件（无引用/已充分/要取的已收集）、迭代取回、轮数上限、不污染图谱节点                       |
 | `test_mysql_store.py`       | MySQL 记忆后端：**生成的 SQL 与绑定参数**（user_id 隔离、排序 LIMIT、画像去重、只吞唯一冲突）、串题注入策略 |
 | `test_long_term.py`         | 长期记忆：**用户隔离（安全关键）**、画像+历史召回、注入段落标注"不得作为法律依据"、后端故障直接暴露 |
+| `test_api_auth.py`          | 注册/登录/登出、Cookie HttpOnly+SameSite、**账号枚举防护**、bcrypt 往返与超长密码 |
+| `test_api_sessions.py`      | 会话 CRUD、**越权访问一律 404**（读/删/提问都不放行）、删除会话连带清长期记忆 |
+| `test_api_chat.py`          | SSE 事件流、意图兜底跳过检索、生成失败仍返回引用、**引用随历史持久化**、串题注入策略 |
 | `test_generation.py`        | 流式逐块输出、聚合、prompt 组装、上下文标题带法律名（mock LLM）                           |
 | `test_logger.py`            | 日志 JSON 事件字段完整性、缺失耗时兜底                                            |
 | `test_eval.py`              | recall@k 指标、评估数据行组装（mock 检索/生成）                                   |

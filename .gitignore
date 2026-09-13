@@ -53,5 +53,8 @@ Thumbs.db
 任务描述.md
 docs/法律问答系统(llm-wiki)
 wiki/concepts/.obsidian
-项目核心功能更新记录表.md
 wiki/
+
+# ===== Docker 运行时数据（容器写出的库数据，不入库） =====
+docker/mysql_data/
+docker/volumes/
