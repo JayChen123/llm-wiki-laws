@@ -48,16 +48,16 @@ services:
       - "etcd"
       - "minio"
 
-  redis:
-    container_name: milvus-redis
-    image: redis:7.2
-    restart: always
-    ports:
-      - "6380:6379"
-    volumes:
-      - ./volumes/redis:/data
-    # 密码见 docker/.env 的 REDIS_PASSWORD
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+#  redis:
+#    container_name: milvus-redis
+#    image: redis:7.2
+#    restart: always
+#    ports:
+#      - "6380:6379"
+#    volumes:
+#      - ./volumes/redis:/data
+#    # 密码见 docker/.env 的 REDIS_PASSWORD
+#    command: redis-server --requirepass ${REDIS_PASSWORD}
 
   mysql:
     image: mysql:8.0.43
