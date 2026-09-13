@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 基于 Python 3.13+ 的劳动法知识问答系统（llm-wiki 理念，**非 RAG**），虚拟环境由本地 **uv** 管理。逻辑分两阶段：
 
 - **图谱存储**：`knowledge_graph.json` 是**权威源**（可 git diff）；pipeline 写完 json 后**同步到 Neo4j**，应用检索时从 Neo4j 读图。改了 json 就重跑 `uv run python -m app.ingest.sync_graph`（`--check-only` 只比对计数）。
-- **摄入（Ingest）**：把 PDF / `data/raw/*.md` 提前"编译"为结构化知识点（当前 **1465** 个，**每一条法条一个知识点**：劳动合同法 98 + 劳动法 107 + 民法典 1260）+ 关联图谱 `knowledge_graph.json`（**21252** 条边）+ Wiki 页面集 `wiki/`。
+- **摄入（Ingest）**：把 PDF / `data/raw/*.md` 提前"编译"为结构化知识点（当前 **1465** 个，**每一条法条一个知识点**：劳动合同法 98 + 劳动法 107 + 民法典 1260）+ 关联图谱 `knowledge_graph.json`（**21252** 条边）+ 人读视图 `wiki/`（全量索引 + log + 少量示例页，**不参与检索**）。
 - **Web 入口**：FastAPI（`app/api/`）提供注册登录 + 多会话 + SSE 流式问答，并**同源托管**前端构建产物（`web/dist`）；前端 React+Vite+Tailwind v4，深色墨蓝+金、法条正文衬线体。**不做容器化部署**（按用户决定）：本地 `uv run python -m app.api.main` + `cd web && npm run build`。
 - **查询（Query）**：先做**意图识别**（可答 / 法律未覆盖 / 无关，非"可答"直接兜底）→ 关键词(BM25) + 向量(bge-m3，存于 **Milvus**) 混合检索定位知识点 → 召回长期记忆（画像+相似历史，按 user_id 过滤）→ qwen-max 综合生成回答，记忆存 MySQL + Milvus。
 
-**为什么不是 RAG**：知识本体是 Markdown 页面 + JSON 图谱（可读、可审计、可随问答复利积累），向量仅参与查询时的召回融合；文档不做切块、向量不作为知识库载体。这一约束贯穿所有代码，改动前先想清楚。
+**为什么不是 RAG**：知识本体是 `knowledge_graph.json` 图谱（应用检索时读 Neo4j 副本；`wiki/` 只是同源生成的**人读视图**，不参与检索），向量仅参与查询时的召回融合；文档不做切块、向量不作为知识库载体。这一约束贯穿所有代码，改动前先想清楚。
 
 完整细节见 `README.md`（架构/评估）与 `HANDOVER.md`（交接/踩坑），本文件只摘录关键。
 
@@ -24,7 +24,7 @@ uv sync                                             # 安装/还原依赖（含 
 uv run python -m app.ingest.pipeline                # 构建知识库：全量重建图谱+wiki，并同步 Neo4j（幂等）
 uv run python -m app.ingest.sync_graph              # 只把 knowledge_graph.json 同步到 Neo4j（--check-only 只比对）
 uv run python -m app.cli                            # 命令行问答（需 export API_KEY 才有 LLM 生成，否则仅展示检索）
-uv run python -m pytest tests/ -v                   # 全部单元测试（当前 201 项）
+uv run python -m pytest tests/ -v                   # 全部单元测试（当前 217 项）
 uv run python -m pytest tests/test_retrieval.py -v  # 跑单个测试文件
 uv run python -m pytest tests/ -k "rrf or bfs" -v   # 按名称过滤
 uv run python -m eval.evaluate --limit 3            # 评估试跑 3 条
@@ -88,7 +88,7 @@ crossref 是让"46条引38条/65条引39条"等被引用条文稳定进入生成
 - 检索参数：`TOP_K=10`、`EXPAND_K=5`、`EXPAND_HOPS=3`、`EXPAND_DECAY=0.5`（**均可环境变量覆盖**）。
   生成上下文 = TOP_K 种子（10）+ ≤EXPAND_K 扩展（5）**+ 反思补取**（每轮可多条）→ 15 起，实测见过 17。
 
-数据新增/更换：把 PDF 放 `data/src/` 或 md 直接放 `data/raw/` 后重跑 pipeline 即自动并入（含同步 Neo4j 与 Milvus）（PDF→MD 增量、知识点合并重编号、图谱与 Wiki 全量重建、**向量全量重写 Milvus 并清理陈旧主键**）。想让概念出现在"核心概念导航"（`wiki/index.md`），需在 `ingest/concept_map.py` 补映射；Wiki 页面落盘在 `ingest/wiki_writer.py`。**改知识源后必须重跑 pipeline**——向量库不会自己发现知识库变了（旧 `.npy` 缓存曾因此静默残留 205 行对着 1238 节点）。
+数据新增/更换：把 PDF 放 `data/src/` 或 md 直接放 `data/raw/` 后重跑 pipeline 即自动并入（含同步 Neo4j 与 Milvus）（PDF→MD 增量、知识点合并重编号、图谱全量重建、**向量全量重写 Milvus 并清理陈旧主键**；`wiki/` 只重建 index 与 log，知识点页仅落盘 `WIKI_SAMPLE_REFS` 示例）。想让概念出现在"核心概念导航"（`wiki/index.md`），需在 `ingest/concept_map.py` 补映射；人读视图落盘在 `ingest/wiki_writer.py`。**改知识源后必须重跑 pipeline**——向量库不会自己发现知识库变了（旧 `.npy` 缓存曾因此静默残留 205 行对着 1238 节点）。
 
 ## 关键版本约束（勿随意改）
 

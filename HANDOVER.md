@@ -18,12 +18,12 @@
 | 维度 | RAG | 本项目（llm-wiki） |
 |---|---|---|
 | 知识构建时机 | 查询时 | **摄入时**（提前"编译"） |
-| 知识库形态 | 向量切块 | **结构化 Wiki 页面 + 关联图谱** |
-| 存储载体 | 向量数据库 | Markdown 页面集 + JSON 图谱 |
+| 知识库形态 | 向量切块 | **法条级知识点 + 关联图谱**（另有 Markdown 人读视图） |
+| 存储载体 | 向量数据库 | JSON 图谱（权威源）+ Neo4j 副本；`wiki/` 仅人读视图 |
 | 查询行为 | 检索→拼接→推理 | 定位知识点 → 综合生成 |
 
 - **不切块**：文档按"编（第X编）→ 章（第X章）→ 节（第X节）→ 条（第X条）"切分为知识点（KnowledgePoint），**粒度：每一条一个知识点**，而非定长 chunk。
-- **向量不承载知识库**：bge-m3 仅用于（a）语义关联边构建、（b）查询时向量召回融合；知识本体在 `wiki/` 与 `knowledge_graph.json`。向量**存于 Milvus** 只是把它当"向量索引"用，不是知识载体（`.npy` 文件缓存已废弃）。
+- **向量不承载知识库**：bge-m3 仅用于（a）语义关联边构建、（b）查询时向量召回融合；知识本体在 `knowledge_graph.json`（应用检索读 Neo4j 副本），`wiki/` 只是由同一份数据生成的**人读视图**（2026-09-13 起只落盘少量示例页，且不参与检索）。向量**存于 Milvus** 只是把它当"向量索引"用，不是知识载体（`.npy` 文件缓存已废弃）。
 - **多跳支持**：检索后沿关联图 BFS 扩展（最多 3 跳）+ prompt 引导 LLM 跨知识点推理。
 
 ---
@@ -46,7 +46,7 @@ uv run python -m app.ingest.pipeline     # 构建知识库（全量重建，幂�
 uv run python -m app.cli                 # 启动命令行问答
 cd web && npm run build && cd ..         # 构建前端（产物 web/dist，由 FastAPI 托管）
 uv run python -m app.api.main            # 启动 Web 服务（http://localhost:8080）
-uv run python -m pytest tests/ -v        # 运行全部测试（当前 201 项）
+uv run python -m pytest tests/ -v        # 运行全部测试（当前 217 项）
 uv run python -m eval.evaluate --limit 3 # 评估（试跑3条）
 uv run python -m eval.evaluate --skip-ragas  # 仅检索质量指标（recall@1/3/5/8）
 uv run python -m scripts.analyze_logs    # 汇总问答日志画像（意图/检索/反思/成本/耗时）
@@ -64,7 +64,6 @@ llm_wiki_laws/
 ├── CLAUDE.md               # 开发规范（先理解→方案→确认→编码；测试后验收）
 ├── HANDOVER.md             # 本文档
 ├── README.md               # 使用文档
-├── 任务描述.md              # 原始任务需求（llm-wiki 问答系统要求）
 ├── .gitignore
 ├── data/
 │   ├── src/                # 原始 PDF 源文件（新增放这里）
@@ -77,7 +76,7 @@ llm_wiki_laws/
 │       └── 中华人民共和国劳动法_中华人民共和国人力资源和社会保障部.md
 ├── docker/
 │   └── docker-compose.yml  # Milvus + etcd/minio + redis + mysql + neo4j（端口见文件）
-├── web/                    # 前端（React+Vite+Tailwind v4）：登录注册 / 多会话 / 流式问答 / 引用溯源
+├── web/                    # 前端（React+Vite+Tailwind v4）：模块导航 / 问答 / 起诉状（骨架）
 ├── app/
 │   ├── api/                # ⑤ Web API（FastAPI）：认证 + 会话 + SSE 问答 + 托管前端产物
 │   ├── config.py           # 应用配置（**唯一配置源**：路径、bge-m3、LLM、Milvus、MySQL、JWT、检索参数）
@@ -92,7 +91,7 @@ llm_wiki_laws/
 │   │   ├── graph_build.py      # 关联图谱构建（4 类边）
 │   │   ├── graph_store.py      # 图谱的 Neo4j 读写（四类关系拆分/全量对齐/批量 UNWIND/seq 排序）
 │   │   ├── sync_graph.py       # knowledge_graph.json → Neo4j 同步入口
-│   │   └── wiki_writer.py      # Wiki 页面落盘（含核心概念导航）
+│   │   └── wiki_writer.py      # 人读视图落盘（index + log + 示例页）
 │   ├── retrieval/          # ② 混合检索
 │   │   ├── embedder.py         # bge-m3 向量编码（测试用假编码器在各测试文件内定义）
 │   │   ├── vector_store.py     # Milvus 向量库：建集合/全量对齐写入/余弦检索
@@ -109,10 +108,10 @@ llm_wiki_laws/
 │       ├── long_term.py        # 长期记忆向量库（Milvus，强制 user_id 过滤）
 │       ├── profile_extractor.py# 画像低频抽取（qwen-turbo）
 │       └── __init__.py         # create_memory_store() + 检索词注入策略
-├── wiki/                   # 编译出的知识库（llm-wiki 页面集，可重新生成）
-│   ├── index.md            #   知识索引（核心概念导航 + 按源文档分组；有"编"的法律按 编→章 两级）
+├── wiki/                   # 人读视图（不参与检索；由 pipeline 重建）
+│   ├── index.md            #   全量索引（核心概念导航 + 按源文档分组；有"编"的法律按 编→章 两级）
 │   ├── log.md              #   构建日志
-│   └── concepts/KP_*.md    #   每个知识点一页（含双向链接）
+│   └── concepts/KP_*.md    #   少量示例页（WIKI_SAMPLE_REFS，讲课时演示用）
 ├── knowledge_graph.json    # 知识点关联图谱（可重新生成，被 gitignore）
 ├── logs/qa.log             # 问答日志（被 gitignore）
 ├── eval/                   # 评估（Ragas 0.3）
@@ -120,7 +119,7 @@ llm_wiki_laws/
 │   ├── metrics.py          #   recall@k 指标（自定义）
 │   ├── evaluate.py         #   评估主程序
 │   └── results/            #   结果输出（被 gitignore）
-└── tests/                  # 单元测试（pytest，201 项；全部离线，不连 Milvus/大模型）
+└── tests/                  # 单元测试（pytest，217 项；全部离线，不连 Milvus/大模型）
 ```
 
 ---
@@ -198,7 +197,8 @@ llm_wiki_laws/
 - `save_graph` / `load_graph`
 
 **`wiki_writer.py`**：
-- `write_wiki()`：生成 `wiki/index.md`（**核心概念导航** + 按源文档分组）、`wiki/concepts/KP_*.md`（含双向链接 `[[KP_xxx]]`）、`wiki/log.md`
+- `write_wiki(points, graph, wiki_dir=None, concepts_dir=None)`：生成 `wiki/index.md`（**核心概念导航** + 按源文档分组，目录仍是**全量**、仍用 `[[KP_xxx]]` 双链写法）、`wiki/log.md`，以及 `wiki/concepts/KP_*.md` —— **只有 `WIKI_SAMPLE_REFS` 列出的示例页**（知识点页不参与检索，故不再逐条落盘）。两个目录参数可注入：单测必须指向 `tmp_path`，否则会往真实 `wiki/` 写
+- `WIKI_SAMPLE_REFS`：示例页白名单 `(法律关键字, 条文)`，复用 `_resolve_concept()` 在建库时解析成 KP id —— **不硬编码 KP 编号**（编号会随知识源增删重分配），未命中则跳过并打印提示
 - `_index_md()`：**有"编"的法律按 编→章 两级分组**（`### 第二编 物权` → `#### 第二章`），无编的维持 doc→章 两级；排序用 `_order_no()`（复用 `cn_to_int`，支持"第二十九章"等）
 - `_resolve_concept(law, article, points)`：概念条文 → 知识点 id，未命中回退纯文本"《law》第X条"
 - `_concept_index_section(points)`：渲染"## 核心概念导航"，概念项链接到 `[[KP_xxx|第X条]]`
@@ -294,20 +294,30 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 - **SSE 事件**：`meta`（引用+耗时）→ `delta`*（正文分片）→ `citations` → `done`；兜底路径为 `fallback`（意图非可答）；生成失败发 `error` 但**仍返回 citations 并写记忆**。
 - **越权防护**：所有会话接口先 `session_belongs_to(session, user_id)`，不属于当前用户一律 **404**（不暴露存在性），且不触发检索。
 - **前端**（`web/`）：React 19 + Vite 8 + Tailwind v4（`@tailwindcss/vite`，无 config 文件）。`web/src/api.js` 用 **fetch + ReadableStream 手动解析 SSE**（`EventSource` 只支持 GET，而问答是 POST）。引用随 assistant 消息存 `messages.citations`（JSON），刷新/切会话后仍可溯源。
+- **模块化外壳与导航**（2026-09-13）：`src/modules.js` 是**功能模块注册表**（`MODULES` 数组，字段
+  `key/glyph/label/hint/component/enabled`），`components/AppShell.jsx` 依它渲染顶栏 + 横向 tab 导航 + 当前模块。
+  **加模块只改注册表**，不动 App/ChatPage；`enabled:false` 的模块照常出现在导航里并带「开发中」标记
+  （`ComplaintPage` 即此状态）。原先写在 ChatPage 里的品牌栏/登出按钮已**上移到 AppShell**，好让导航对所有模块生效；
+  模块组件统一收 `{ user, onLogout }`。
+- **正文 Markdown 统一入口**：`components/MarkdownBody.jsx`（内置 `remark-gfm` + 表格横向滚动容器 + `.answer-body`
+  排版类）。问答回答与起诉状预览都用它——**新增模块请复用，别各自引入 `react-markdown`**（见 §9 第 38 条）。
+- **起诉状生成模块**（`pages/ComplaintPage.jsx`）：只做前端骨架——表单（原告/被告/诉讼请求/事实与理由/证据清单/
+  受诉法院）+ 本地拼接的实时预览，提交与导出按钮置灰。**不调后端**，后端能力（要素抽取、法条引用、导出）待迭代；
+  接入时把 `buildComplaint()` 换成后端返回的文书即可，表单与预览不用动。
 
 ### 5.8 知识库加载（`app/kb.py`）
 
 - `KnowledgeBase.load(embedder=None, store=None)`：加载图谱 + 连 Milvus + 构建 HybridRetriever；**Milvus 不可用**（服务未启动/集合不存在）时打印告警并退化为纯关键词检索，不抛异常。`store` 可注入供离线测试。
 - `search(query, top_k)` 统一检索入口
 
-### 5.7 CLI（`app/cli.py`）
+### 5.9 CLI（`app/cli.py`）
 
 - 交互式问答：加载知识库 → 会话ID → 循环问答
 - 短期记忆注入 → 混合检索 → 流式生成 → **记录日志** → 写记忆
 - 命令：`/exit` `/clear` `/help`
 - 未配置 `API_KEY` 时降级为仅展示检索结果
 
-### 5.8 日志（`app/logger.py`）
+### 5.10 日志（`app/logger.py`）
 
 - `RotatingFileHandler` 滚动写入 `logs/qa.log`（5MB×5），每次问答一条 JSON，**字段按需出现**。
 - `log_qa_event()` 的字段分工（**三类来源分开记**，用于排查"某个法条为什么没进上下文"）：
@@ -360,14 +370,13 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 
 ---
 
-## 7. 测试（`tests/`，201 项全过）
+## 7. 测试（`tests/`，217 项全过）
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_knowledge_extract.py` | 清洗、编/章/节/条解析、康熙部首变体、交叉引用排除、表格回填、关键词、**千位条号**、**编层级与同号章区分**、**分编边界**、**裸域名/斜杠日期噪音**、**`\f` 行号**、真实 md 提取（98/107/**1260** 条） |
 | `test_concept_map.py` | 概念映射的文档感知匹配、关键词注入去重、未映射跳过、**民法典概念（含千位条号）** |
 | `test_graph_build.py` | sibling/keyword/semantic 三类边 + **crossref 交叉引用边**（FakeEmbedder）+ **跨编同号章不建 sibling 边** + **千位条号 crossref** |
-| `test_graph_store.py` | Neo4j 图存储：Cypher 与绑定参数、全量对齐、批量、seq 排序、空关键词存 None（假 driver，离线） |
 | `test_milvus_store.py` | 集合 schema/索引、维度不符重建、全量对齐写入、**陈旧主键清理（含可见性延迟下的顺序回归）**、`(kp_id, score)` 返回、条数统计（假 client，离线） |
 | `test_kb.py` | Milvus 可用时启用向量检索、**不可用时退化为纯关键词且不抛异常** |
 | `test_retrieval.py` | BM25（含关键词字段）、向量（假 store）、RRF 融合、图谱多跳扩展 |
@@ -386,7 +395,7 @@ qwen-turbo 抽一次，只抽用户自身相关且跨会话有用的事实，**�
 | `test_graph_store.py` | Neo4j 图存储：Cypher 与参数、全量对齐、四类关系拆分、`:CROSSREF` 方向派生、节点对归一化、seq 排序（假 driver，离线） |
 | `test_eval.py` | recall@k 指标、评估数据行组装（mock 检索/生成） |
 | `test_pipeline.py` | PDF 发现、增量转换、md 发现、多文档全局编号 |
-| `test_wiki_writer.py` | 概念导航链接渲染、跨文档条文消歧、**编→章 两级目录分组**、**章号数值排序** |
+| `test_wiki_writer.py` | 概念导航链接渲染、跨文档条文消歧、**编→章 两级目录分组**、**章号数值排序**、**只落盘示例页而索引仍全量**、示例清单未命中不报错、**不写真实 `wiki/`**（目录可注入）、示例清单对真实图谱全部命中 |
 
 测试策略：**不加载真实大模型/PDF、不连 Milvus、不调 LLM**，用各测试文件自带的假编码器（`StubEmbedder`/`FakeEmbedder`）、假向量库（`StubVectorStore`/`FakeMilvusClient`）与 mock 客户端。`test_knowledge_extract` 的 `test_real_markdown_extracts` 仅在 `data/raw` 有 md 时运行。
 
@@ -402,7 +411,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
   └─► bge-m3 语义向量（只编码一次：既供语义边、也写 Milvus）
   └─► 关联图谱 knowledge_graph.json（sibling/keyword/semantic/crossref，21252 边）
   └─► Milvus 集合 llm_wiki_laws（全量对齐写入 + 清理陈旧主键）
-  └─► wiki/ 页面集（index 含核心概念导航；有"编"的法律按 编→章 两级）
+  └─► wiki/ 人读视图（index 全量索引 + log + 10 个示例页；不参与检索）
 ```
 
 **问答**（`uv run python -m app.cli`）：
@@ -437,8 +446,10 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 13. **多法同条号混淆**：多部法律同有 85/98 等条文号，生成上下文标题必须带法律名，否则 LLM 会张冠李戴；民法典标题还带编名。
 14. **bge-m3 模型较大**（2.2GB），首次加载慢；`graph_build` 编码一次后向量复用（语义边 + Milvus 写入库），不要再重复编码。
 15. **知识库规模**：1465 知识点 / 21252 边（sibling 15306 / semantic 11720 / keyword 3446 / crossref 97）；语义阈值 0.75（0.65 会近全连接），keyword 0.3，crossref 权重 1.5。
-16. `.gitignore` 忽略：`data/`、`logs/`、`eval/results/`、`.claude/`、`CLAUDE.md`、`任务描述.md`、`.venv/`、`__pycache__/` 等。
-    **知识本体全部入库**：`knowledge_graph.json` 与 `wiki/`（1465 个知识点页 + index + log）都被 git 跟踪，便于看差异与审计；唯一例外是 `wiki/concepts/.obsidian/`（Obsidian 本地 UI 状态，已忽略且已移出跟踪）。
+16. `.gitignore` 忽略：`logs/`、`eval/results/`、`.claude/`、`.venv/`、`__pycache__/`、`wiki/concepts/.obsidian` 等。
+    ⚠️ 三处历史记载与现状不符（2026-09-13 核对）：① 文件里那行 `CLAUDE.md` 是**注释掉的**，所以 CLAUDE.md **已被 git 跟踪**（不是"被忽略"）；② `任务描述.md` **已不在工作区**（结构树里那条已删）；③ ` data/` 一行带**前导空格**，git 不当作忽略规则，`data/` 实际**未被忽略**——这与本意"数据源默认提交以重建知识库"一致，但规则写法是坏的。
+    **知识入库情况**：`knowledge_graph.json`（权威源）与 `wiki/` 都被 git 跟踪，便于看差异与审计。
+    ⚠️ 2026-09-13 起知识点页**只在磁盘保留 10 个示例页**（`WIKI_SAMPLE_REFS`），但 git 里**仍跟踪原有 1465 页**（当时按"仅删磁盘、不动 git"处理）——于是 `git status` 会长期显示约 1455 条 `D`，且 **`git checkout .` 会把它们全部恢复回磁盘**（恢复后就与"只留示例页"的预期不符，需手工清理）。`wiki/concepts/.obsidian/`（Obsidian 本地 UI 状态）已忽略且已移出跟踪。
 17. **意图识别别"两头堵"**：分类器**只做路由**，不参与知识定位；且任何故障都要**保守放行**（归 `ANSWERABLE`）。反过来若把分类做得过于激进，正常法律问题会被误判成"未覆盖"而白白拒答——改动分类提示词或换模型后，跑 `uv run python -m eval.evaluate --skip-ragas --intent` 看误判率（用例全是法律题，非 `answerable` 即为误判）。
 18. **反思式检索别做成"纯反思"**：曾实现过一版"反思完全替代图谱扩展、候选只有引用关系"，recall@8 从 **0.9262 掉到 0.8548** —— 掉的全是 sibling/semantic 邻居带来的补充（它们不属于"引用关系"）。现方案是 **reflect = 基础扩展 + 反思补取**（超集），recall 与 bfs 完全一致（0.431/0.7119/0.8405/0.9262）。改这块务必先跑 `RETRIEVAL_MODE=reflect` 与 `bfs` 两遍 `eval --skip-ragas` 对比。
 19. **反思的增量天然有限**：全库只有 **68/1465** 个知识点正文里有可跟进的同法引用（97 处），且这些被引条文大多已被基础扩展（crossref 权重 1.5）带进上下文。实测 35 条用例中：19 条因"无引用关系"零额外调用、约 20 条各多 1 次 qwen-turbo、**只有 2 条真正补到条文（+4 个知识点）**。若想让反思承担更多，可考虑调低 BFS 的 crossref 权重把引用链让给反思（未验证）。
@@ -455,17 +466,27 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 30. **同一函数里派生副本的失败策略要一致**：pipeline 里 Milvus 写入原本 try/except 警告后继续，而 Neo4j 同步直接失败——两者都是派生副本，已统一为**都显式失败**（json 已落盘，构建结果不会丢）。
 31. **改完 `kb.load()` 后留意变量名**：我曾用 `store = Neo4jGraphStore()` 覆盖了 `load(store=...)` 这个**注入 Milvus 向量库的参数**，导致测试注入失效（`test_kb` 抓到）。图存储请用 `graph_store` 之类的名字。
 32. **凭证只放一处**：服务账号密码集中在 `docker/.env`（不入库），compose 与应用共用；应用侧用 `python-dotenv`（`override=False, interpolate=False`）只填空缺、**不覆盖已有环境变量**、不展开 `$`。密码里应避免 `$`（compose 需 `$$` 转义，而 dotenv 按字面读取不还原）。注意由此带来的变化：应用的 MySQL 连接账号从 `root` 变成了 `.env` 里的 `vincent`（最小权限，已验证建表/读写/画像都够用）；想继续用 root 就把 `MYSQL_USER` 改回 root。
-33. **图谱已纳入 git**：`knowledge_graph.json` 现被跟踪（提交在「数据库迁移neo4j」），`.gitignore` 里那条旧忽略规则已删——留着虽对已跟踪文件无效，却会让 `git check-ignore` 误导性地报"已忽略"。同时把 `wiki/` 从忽略里移除、1260 个新知识点页纳入版本库（git 里现为 1465 页 + index + log），并把 5 个 `.obsidian/` UI 状态文件移出跟踪（磁盘保留）——此前它们是"已跟踪但被忽略"，与刚修的那个矛盾同源。
+33. **图谱已纳入 git**：`knowledge_graph.json` 现被跟踪（提交在「数据库迁移neo4j」），`.gitignore` 里那条旧忽略规则已删——留着虽对已跟踪文件无效，却会让 `git check-ignore` 误导性地报"已忽略"。同时把 `wiki/` 从忽略里移除、1260 个新知识点页纳入版本库（git 里现为 1465 页 + index + log），并把 5 个 `.obsidian/` UI 状态文件移出跟踪（磁盘保留）——此前它们是"已跟踪但被忽略"，与刚修的那个矛盾同源。（2026-09-13 起磁盘上只保留 10 个示例页，git 索引未动，见第 16 条。）
 34. **测试绝不能写生产日志**：API 层用的是模块级真实 logger，`tests/conftest.py` 若不替换它，**跑一次 pytest 就往 `logs/qa.log` 写几十条假问答事件**（曾污染 297 条、占日志 69%，既毁审计也毁日志分析）。夹具已注入 `NullLogger`，并有回归测试卡住（`test_api_tests_do_not_write_production_log`）。
 35. **config 里的参数一定确认真的传下去了**：`kb.py` 构造 `HybridRetriever` 时曾**没传** `EXPAND_K/EXPAND_HOPS/EXPAND_DECAY`，于是长期沿用构造函数默认 `expand_k=3`，而 config 与文档都写着 5 —— 是日志里 `graph_expanded` 恒为 3 才暴露的。`TOP_K` 之所以正常，是因为它由调用方（CLI/Web/eval）显式传给 `search(top_k=...)`。现已显式传入并有回归测试（`test_expand_params_flow_from_config`）。
 36. **`EXPAND_K` 只影响第 6 位之后的补充条数**：eval 用 `--top-k 5`，`recall@8` 只看前 8 位（= 5 种子 + 前 3 扩展），而 hop=1 的扩展分数最高，所以 `EXPAND_K` 从 3 改到 5 **recall@1/3/5/8 逐位不变**（实测两组数字完全相同）；它的真实影响在**生成上下文规模**：生产路径 13 → 15 块。评估想反映扩展规模，得调 `--top-k` 而不是只看 recall。
-37. 项目已 `git init`（当前分支 `v1.1`，主分支 main）。
+37. 项目已 `git init`（当前分支 **`v2.0`**，主分支 main；另有 `v1.0`/`v1.1` 历史分支）。
+38. **`react-markdown` 默认不含 GFM，表格会原样吐出来**：本项目一直只装了 `react-markdown`（它的依赖里只有
+    remark-parse/remark-rehype），所以回答里的 markdown 表格**不渲染**，`| a | b |` 与 `| --- | --- |` 被当成普通
+    段落文字显示。修复：装 `remark-gfm` 并给 `<Markdown>` 挂 `remarkPlugins={[remarkGfm]}`（顺带支持删除线、
+    任务列表、自动链接）。表格还要**外包一层 `overflow-x:auto`**——气泡不定宽，宽表会撑破布局。
+    为避免再踩：渲染 markdown 一律走 `components/MarkdownBody.jsx`，不要在模块里各自写 `<Markdown>`。
+39. **前端骨架模块别急着接后端**：起诉状模块先只做"表单 + 本地拼接预览"，是为了把**字段与文书格式**定稿，
+    再接生成能力；按钮置灰 + 「开发中」标记（`MODULES[].enabled=false`）能诚实地告诉使用者当前边界。
 
 ---
 
 ## 10. 后续开发建议（供参考）
 
 - **检索增强**：可选实现"查询分解"（LLM 拆子问题分别检索再合并）——已讨论，当前未实现（已实现 A：图谱多跳 + crossref + 概念关键词增强 + E：prompt 多跳引导）。
+- **起诉状生成的后端接入**（前端骨架已就位，见 §5.7 与 §9 第 39 条）：确定接口形态（是否复用检索链路取"事实与理由"
+  的法条依据）→ 把 `ComplaintPage.buildComplaint()` 换成调后端 → `MODULES` 里该项 `enabled` 改 true、去掉按钮 `disabled`。
+  注意：起诉状属于**文书生成**而非问答，若要引用法条，应复用 `KnowledgeBase.search` 而不是重造检索。
 - **宽泛措施题**：eval_026/030 类"维权途径/责任"题，可考虑按预期条文补 crossref 或概念映射，或放宽生成上下文。
 - **实体链接 + 图传播**：从 query 抽实体 → 图谱节点 → 影响力传播召回。
 - **评估完善**：可增加"测试集抽样"、`--limit` 随机采样、结果对比历史版本。
@@ -478,7 +499,7 @@ data/raw/*.md ──编/章/节/条切分──► KnowledgePoint[]（1465，全
 ## 11. 验收/继续开发检查清单
 
 - [ ] Milvus 在跑：`docker ps` 见 `milvus-standalone`（宿主机端口 **19532**）
-- [ ] `uv run python -m pytest tests/ -v` → **201 passed**
+- [ ] `uv run python -m pytest tests/ -v` → **217 passed**
 - [ ] `uv run python -m app.ingest.pipeline` → **1465 知识点 / 21252 关联边** + `向量已写入 Milvus 集合 llm_wiki_laws：1465 条`
 - [ ] Milvus 条数核对：`MilvusVectorStore().count()` → 1465
 - [ ] `export API_KEY=... && uv run python -m app.cli` → 多轮问答正常（含民法典问题，如"高空抛物致人损害谁担责"应命中第一千二百五十四条）

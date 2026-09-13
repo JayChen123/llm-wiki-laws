@@ -16,7 +16,7 @@ from app.ingest.graph_build import build_graph, save_graph, semantic_text
 from app.ingest.knowledge_extract import KnowledgePoint, extract_knowledge_points
 from app.ingest.pdf_to_markdown import pdf_to_markdown
 from app.ingest.sync_graph import sync_from_json
-from app.ingest.wiki_writer import write_wiki
+from app.ingest.wiki_writer import WIKI_SAMPLE_REFS, write_wiki
 from app.retrieval.embedder import Embedder
 from app.retrieval.vector_store import MilvusVectorStore
 
@@ -100,7 +100,10 @@ def run_pipeline(use_semantic: bool = True, verbose: bool = True) -> dict:
     write_wiki(points, graph)
     if verbose:
         n_edges = len(graph["edges"])
-        print(f"[pipeline] 关联边 {n_edges} 条，已写入 {GRAPH_PATH.name} 与 wiki/")
+        print(
+            f"[pipeline] 关联边 {n_edges} 条，已写入 {GRAPH_PATH.name} 与 wiki/"
+            f"（index + log + {len(WIKI_SAMPLE_REFS)} 个示例页）"
+        )
     return graph
 
 

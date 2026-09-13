@@ -4,18 +4,22 @@
 提前"编译"为结构化的**知识点图谱**，查询时通过 **关键词（BM25）+ 向量（bge-m3）混合检索**定位知识点，再由大模型 `qwen-max`
 综合生成回答，并带**短期记忆**支持多轮对话。
 
-> 本项目**不是 RAG 系统**：不对文档切块、不把向量作为知识库存储载体。知识库本体是结构化 Wiki 页面 + 关联图谱
-> （`knowledge_graph.json` 为权威源，另同步一份到 Neo4j 供图查询），向量检索仅作为混合召回手段之一。
+> 本项目**不是 RAG 系统**：不对文档切块、不把向量作为知识库存储载体。知识库本体是**法条级知识点关联图谱**
+> （`knowledge_graph.json` 为权威源，另同步一份到 Neo4j 供图查询；`wiki/` 只是同源生成的人读视图，不参与检索），
+> 向量检索仅作为混合召回手段之一。
 
 ---
 
 ## 一、核心特性
 
 - **Web 界面（多用户）**：注册/登录（bcrypt + JWT HttpOnly Cookie）、多会话管理与历史切换、**流式打字机**回答、**引用溯源面板**（列出命中的知识点、法律名、分数与原文行号）；深色科技墨蓝 + 金色点缀、法条正文用衬线体。前端构建产物由 FastAPI **同源托管**（无 CORS/CSRF 配置负担）。
+- **功能模块导航（可扩展）**：顶栏横向 tab 由 `web/src/modules.js` 的**模块注册表**驱动，新增模块只需追加一条记录；
+  未就绪的模块也能先出现在导航里（带「开发中」标记）。当前内含**法律问答**与**起诉状生成（前端骨架）**两个模块。
+- **Markdown 完整渲染**：回答与文书预览都经 `MarkdownBody` 渲染，支持 **GFM 表格**、列表、引用块等（法条正文用衬线体）。
 - **意图识别与兜底**：问答前先分类为「可答 / 法律相关但本库未覆盖 / 与法律无关」，后两类直接给兜底话术（说明本库覆盖范围 + 可问示例），**不检索也不生成**；分类器超时或异常时保守放行，不阻断正常问答。
 - **llm-wiki 知识编译**：摄入时把 PDF 编译为知识点 + 关联图谱，查询时只做"定位 + 综合"，知识与答案随时间复利积累。
-- **非 RAG 知识库**：不切块、不向量化存储；知识库是 `wiki/` 下的 Markdown 页面集 + `knowledge_graph.json`
-  关联图谱，可直接用上下文窗口承载、可读可审计。
+- **非 RAG 知识库**：不切块、不向量化存储；知识本体是 `knowledge_graph.json` 关联图谱（检索时读 Neo4j 副本），
+  可直接用上下文窗口承载、可读可审计；`wiki/` 另出一份**人读视图**（全量索引 + 少量示例页），不参与检索。
 - **法条级知识点**：按"编（第X编）→ 章（第X章）→ 节（第X节）→ 条（第X条）"切分，**每一条一个知识点**（劳动合同法 98 条 +
   劳动法 107 条 + 民法典 1260 条 = **1465 个**），可精确溯源到具体法条。
 - **混合检索**：BM25 关键词检索（索引含**概念关键词增强**，弥合法律措辞与用户口语鸿沟）与 bge-m3 向量检索（**存于 Milvus**）双路召回，*
@@ -71,7 +75,7 @@
 │   │      crossref 正文「第X条」引用（权重 1.5，仅同法内）                          │
 │   │      └─► 同步 ──► Neo4j 图数据库（应用检索时从这里读图）                       │
 │   ├─► 向量 → Milvus llm_wiki_laws（dim1024 · HNSW+COSINE · 全量对齐+清理陈旧）     │
-│   └─► Wiki 页面集 wiki/（index.md 概念导航 + 1465 个知识点页 + log.md）            │
+│   └─► wiki/（index.md 概念导航 + log.md + 10 个示例页；不参与检索）                │
 └────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─ ③ 问答链路（Query · 在线） ───────────────────────────────────────────────────────┐
@@ -109,7 +113,7 @@
 │Neo4j  图数据库（查询副本）：节点 + 四类关系（SIBLING/KEYWORD/SEMANTIC/CROSSREF）   │
 │Milvus 向量（非知识载体）：llm_wiki_laws 法律向量 │ llm_wiki_user_memory 用户记忆   │
 │MySQL  记忆唯一后端：users · sessions · messages(含 citations) · user_profile       │
-│文件   权威源（人读/可审计/可 git diff）：knowledge_graph.json 图谱 │ wiki/ 页面集  │
+│文件   权威源（人读/可审计/可 git diff）：knowledge_graph.json │ wiki/ 索引+示例页  │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -119,11 +123,12 @@
 |---|---|---|
 | 何时跑 | 离线；数据变更后重跑 `app.ingest.pipeline`（幂等全量重建） | 每次提问；Web 与 CLI 共用 |
 | 输入 | `data/src/*.pdf`、`data/raw/*.md` | 用户问题（+ 会话历史 + 用户记忆） |
-| 产出 | `knowledge_graph.json`（权威源）、**同步到 Neo4j**（四类关系）、`wiki/` 页面集、Milvus 法律向量 | 带引用的回答；写回短期与长期记忆 |
+| 产出 | `knowledge_graph.json`（权威源）、**同步到 Neo4j**（四类关系）、Milvus 法律向量、`wiki/` 人读视图（index + log + 示例页） | 带引用的回答；写回短期与长期记忆 |
 
-**为什么不是 RAG**：文档不在查询时切块、向量不作为知识载体。知识本体是 `wiki/concepts/*.md`
-（1465 页，每页一条法条）与 `knowledge_graph.json`（21252 条关联边），可直接用上下文窗口承载、
-可读可审计；Neo4j 与 Milvus 都是**派生副本**（前者存图、后者存向量），不是知识本体。
+**为什么不是 RAG**：文档不在查询时切块、向量不作为知识载体。知识本体是 `knowledge_graph.json`
+（1465 个法条级知识点 / 21252 条关联边），可直接用上下文窗口承载、可读可审计；Neo4j 与 Milvus
+都是**派生副本**（前者存图、后者存向量），不是知识本体。`wiki/` 则是由同一份数据生成的**人读视图**
+（全量索引 + 少量示例页，**不参与检索**），随 pipeline 重建——它是产物，不是输入。
 
 ---
 
@@ -144,9 +149,11 @@ llm_wiki_laws/
 │       ├── 中华人民共和国民法典.md
 │       └── 中华人民共和国劳动法_中华人民共和国人力资源和社会保障部.md
 ├── web/                          # 前端（React + Vite + Tailwind v4）
+│   ├── src/modules.js            #   **功能模块注册表**（顶栏导航与内容区由此驱动）
 │   ├── src/api.js                #   API 层：fetch + 手动解析 POST 的 SSE
-│   ├── src/pages/                #   AuthPage（登录注册）/ ChatPage（问答主界面）
-│   ├── src/components/           #   SessionList / MessageList / CitationPanel / Composer
+│   ├── src/pages/                #   AuthPage（登录注册）/ ChatPage（问答）/ ComplaintPage（起诉状，骨架）
+│   ├── src/components/           #   AppShell（外壳+导航）/ SessionList / MessageList / MarkdownBody
+│   │                             #   / CitationPanel / Composer
 │   └── dist/                     #   构建产物（由 FastAPI 托管）
 ├── app/
 │   ├── api/                      # ⑤ Web API（FastAPI）
@@ -166,7 +173,7 @@ llm_wiki_laws/
 │   │   ├── graph_build.py        #    关联图谱构建（sibling/keyword/semantic/crossref）
 │   │   ├── graph_store.py        #    图谱的 Neo4j 读写（四类关系拆分、全量对齐、批量 UNWIND、seq 排序）
 │   │   ├── sync_graph.py         #    knowledge_graph.json → Neo4j 同步入口（含 --check-only）
-│   │   ├── wiki_writer.py        #    Wiki 页面集落盘（index 含核心概念导航）
+│   │   ├── wiki_writer.py        #    人读视图落盘（index + log + 示例页）
 │   │   └── pipeline.py           #    管线入口
 │   ├── retrieval/                # ② 混合检索
 │   │   ├── embedder.py           #    bge-m3 向量编码器
@@ -183,19 +190,19 @@ llm_wiki_laws/
 │       ├── long_term.py          #    长期记忆向量库（Milvus，强制 user_id 过滤）
 │       ├── profile_extractor.py  #    画像低频抽取（qwen-turbo）
 │       └── __init__.py           #    create_memory_store() + 检索词注入策略
-├── wiki/                         # 编译出的知识库（llm-wiki 页面集）
-│   ├── index.md
-│   ├── log.md
-│   └── concepts/KP_*.md          # 1465 个知识点页面
+├── wiki/                         # 人读视图（不参与检索，由 pipeline 重建）
+│   ├── index.md                  #   全量索引（核心概念导航 + 按文档分组）
+│   ├── log.md                    #   构建日志
+│   └── concepts/KP_*.md          #   少量示例页（讲课用，见 WIKI_SAMPLE_REFS）
 ├── knowledge_graph.json          # 知识点关联图谱（**权威源**，节点 + 带类型边；Neo4j 由它同步）
 ├── logs/
 │   └── qa.log                    # 问答日志（滚动，JSON 事件流）
 ├── eval/                         # 评估
-│   ├── qa_test_cases.jsonl       #   35 条劳动法评估用例（单跳/多跳/复杂）
+│   ├── qa_test_cases.jsonl       #   55 条评估用例（劳动法/劳动合同法 35 + 民法典 20）
 │   ├── metrics.py                #   recall@1/3/5/8 检索指标（自定义）
 │   ├── evaluate.py               #   评估主程序（recall@k + ragas）
 │   └── results/                  #   评估结果输出
-├── tests/                        # 单元测试（pytest，201 项）
+├── tests/                        # 单元测试（pytest，217 项）
 └── README.md
 ```
 
@@ -228,15 +235,16 @@ llm_wiki_laws/
 5. **关联图谱构建**：四类带类型边——`sibling`（同 **(编, 章)** 条文）、`keyword`（关键词 Jaccard ≥0.3）、`semantic`（bge-m3 余弦 ≥0.75）、`crossref`
    （正文"第X条"交叉引用，权重 1.5，仅同法内），输出 `knowledge_graph.json`（1465 节点 / 21252 边）。
 6. **向量写入 Milvus**：知识点向量（dim 1024）写入集合 `llm_wiki_laws`，索引 HNSW + COSINE；写入采用**全量对齐**并删除已不在知识库中的陈旧主键，保证集合内容与当前知识库一致。
-7. **Wiki 页面落盘**：生成 `wiki/index.md`（**核心概念导航** + 按源文档分组）、`wiki/concepts/*.md`（每页含双向链接
-   `[[KP_xxx]]`）、`wiki/log.md` 日志。
+7. **Wiki 人读视图落盘**：生成 `wiki/index.md`（**核心概念导航** + 按源文档分组的**全量**目录，保留 `[[KP_xxx]]`
+   双链写法）、`wiki/log.md` 日志，以及 `wiki/concepts/*.md` **只有 `WIKI_SAMPLE_REFS` 列出的少量示例页**
+   （讲课演示用；知识点页不参与检索，故不再逐条落盘——检索读的是 Neo4j + Milvus）。
 
 ---
 
 ## 五、混合检索（Query）
 
 0. **意图识别**（`app/generation/intent.py`，可通过 `INTENT_ENABLED` 关闭）：判定为`legal_uncovered`（刑法/行政法/公司法等其他部门法）或`off_topic`（与法律无关）时，直接返回兜底话术，**不进检索与生成**，但照常写记忆与日志（日志带 `intent` 字段）；分类器超时（默认 3s）、异常或无 `API_KEY` 时保守放行。
-1. **记忆注入**：取出最近一条用户问题并入当前检索词，使"那/具体/继续"等指代延续有效。
+1. **记忆注入（按需）**：**仅当**当前问题"像追问"（含"那/具体/继续"等指代词，或很短且不含法律实体词）时，才把上一问并入检索词以延续指代；换话题时**不并入**，避免串题污染（策略见 §六 `MEMORY_INJECT_MODE`）。
 2. **双路召回**：
     - 关键词：jieba 分词 + `BM25Okapi`，索引含标题、正文与**概念增强后的关键词**（用户口语词可命中法律条文）；
     - 向量：bge-m3 编码 query，到 **Milvus** 做余弦检索，命中的 `kp_id` 映射回知识点。
@@ -366,6 +374,12 @@ uv run python -m app.api.main         # 打开 http://localhost:8080
 ```
 
 - 前端开发模式：`cd web && npm run dev`（已配 `/api` 代理到 8080）
+- **扩展新功能模块**：在 `web/src/modules.js` 的 `MODULES` 数组里追加一条
+  `{ key, glyph, label, hint, component, enabled }` 即可——`AppShell` 的导航条与内容区自动生效，
+  不需要改 `App.jsx` / `ChatPage`。`enabled: false` 表示"入口先曝光、后端未就绪"，导航里会带一枚
+  「开发中」标记（`ComplaintPage` 就是这种状态）。模块组件统一收到 `{ user, onLogout }`。
+- 正文 Markdown 统一走 `web/src/components/MarkdownBody.jsx`（内置 `remark-gfm`）——**新模块渲染 markdown
+  请复用它**，不要各自引入 `react-markdown`（漏挂 GFM 插件会退回"表格原样输出"）。
 - 冒烟自检：服务起来后跑 `scripts/smoke_api.sh`（注册→建会话→流式问答→引用持久化→登出）
 - **JWT_SECRET**：生产环境务必用环境变量覆盖（默认值仅供本地开发）
 - 记忆与向量依赖 MySQL（3308）与 Milvus（19532），需先 `cd docker && docker compose up -d` 启动这两个服务
@@ -447,7 +461,7 @@ uv run python -m pytest tests/ -v
 
 ## 十、测试
 
-`tests/`（**201 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
+`tests/`（**217 项**）全部使用轻量假数据，**不加载大模型、不连 Milvus、不调 LLM**：
 
 | 测试文件                        | 覆盖范围                                                              |
 |-----------------------------|-------------------------------------------------------------------|
@@ -471,7 +485,8 @@ uv run python -m pytest tests/ -v
 | `test_analyze_logs.py`       | 日志画像：解析容错（坏行/缺字段）、停止原因归类（含"未知归 other"）、成本估算、用户过滤 |
 | `test_logger.py`            | 日志 JSON 事件字段完整性、缺失耗时兜底                                            |
 | `test_eval.py`              | recall@k 指标、评估数据行组装（mock 检索/生成）                                   |
-| `test_wiki_writer.py`       | 概念导航链接渲染、跨文档条文消歧、编→章 两级目录分组、章号数值排序                                |
+| `test_pipeline.py`          | PDF 发现、增量转换、md 发现、多文档全局统一编号                                        |
+| `test_wiki_writer.py`       | 概念导航链接渲染、跨文档条文消歧、编→章 两级目录分组、章号数值排序、**只落盘示例页而索引仍全量**、示例清单未命中不报错、**不写真实 `wiki/`**、示例清单对真实图谱全部命中 |
 
 ---
 
@@ -536,7 +551,7 @@ uv run python -m eval.evaluate --skip-ragas --source 民法典   # 只看某部�
 
 ## 十二、FAQ
 
-- **为什么不叫 RAG？** 知识库以结构化 Wiki 页面 + 关联图谱为本体，摄入时一次编译；向量仅参与查询时的召回融合，不是存储与检索的载体。向量放进 Milvus 也只是把它当"向量索引"，不是知识载体。
+- **为什么不叫 RAG？** 知识库以**法条级知识点关联图谱**（`knowledge_graph.json`，检索读 Neo4j 副本）为本体，摄入时一次编译；向量仅参与查询时的召回融合，不是存储与检索的载体。向量放进 Milvus 也只是把它当"向量索引"，不是知识载体。`wiki/` 是由图谱生成的人读视图（全量索引 + 少量示例页），可随时重建，**不参与检索**。
 - **更换/新增法律文档怎么办？** 更新 `data/` 下的 PDF 或 Markdown，**重新运行构建管线**（图谱、Wiki、Milvus 向量都会重建/重写）；如需在"核心概念导航"中出现，在 `concept_map.py` 补映射。
 - **知识点粒度如何调整？** 当前按"每一条（第X条）"切分；修改 `knowledge_extract.py` 的编/章/节/条切分正则可改为按"（一）"项或整章切分。
 - **为什么正文里的"第三十九条和第四十条"不会被误当成新条文？** 条文头要求"第X条"后紧跟空白，折行交叉引用条后无空白，据此区分。

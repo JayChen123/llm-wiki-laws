@@ -3,19 +3,55 @@ from __future__ import annotations
 
 import datetime
 import re
+from pathlib import Path
 
 from app.config import CONCEPTS_DIR, WIKI_DIR
 from app.ingest.concept_map import CONCEPT_MAP
 from app.ingest.knowledge_extract import KnowledgePoint, cn_to_int
 
+# 落盘示例页的白名单：(来源文档关键字, 条文)。
+# 知识点页**不参与检索**（query 读 Neo4j + Milvus），它只是"人读视图"，故只保留少量
+# 讲课用的样本；其余条文仍完整出现在 index.md 目录中（索引本身仍是全量的）。
+# 这里写 (法律, 条文) 而非 KP 编号——编号会随知识源增删重新分配，硬编码会静默指错页。
+WIKI_SAMPLE_REFS: list[tuple[str, str]] = [
+    ("劳动合同法", "第一条"),          # 无"编"的基础形态
+    ("劳动合同法", "第十九条"),        # 试用期（概念导航命中）
+    ("劳动合同法", "第三十八条"),      # crossref 被引方
+    ("劳动合同法", "第四十六条"),      # crossref 引用方（引第三十八条）
+    ("劳动合同法", "第八十五条"),      # 与劳动法同条号的消歧样本
+    ("劳动法", "第四十四条"),          # 加班费（跨法概念导航）
+    ("民法典", "第一条"),              # 有"编"：title 带"第一编 总则"
+    ("民法典", "第五百一十一条"),      # 民法典内部引用链
+    ("民法典", "第一千二百五十四条"),  # 千位条号 + 编名（高空抛物）
+    ("民法典", "第一千零七十七条"),    # 离婚冷静期（概念导航命中）
+]
 
-def write_wiki(points: list[KnowledgePoint], graph: dict) -> None:
-    """生成 index.md、concepts/*.md、log.md。"""
-    CONCEPTS_DIR.mkdir(parents=True, exist_ok=True)
-    (WIKI_DIR / "index.md").write_text(_index_md(points, graph), encoding="utf-8")
-    for p in points:
-        (CONCEPTS_DIR / f"{p.id}.md").write_text(_concept_md(p, graph), encoding="utf-8")
-    (WIKI_DIR / "log.md").write_text(
+
+def write_wiki(
+    points: list[KnowledgePoint],
+    graph: dict,
+    wiki_dir: Path | None = None,
+    concepts_dir: Path | None = None,
+) -> None:
+    """生成 index.md、log.md 与示例页 concepts/*.md。
+
+    目录可注入：单测必须能指向 tmp_path，否则跑一次测试就往真实 `wiki/` 写
+    （理由同 `tests/conftest.py` 注入 `NullLogger`——测试不能写生产产物）。
+    """
+    wiki_dir = WIKI_DIR if wiki_dir is None else wiki_dir
+    concepts_dir = CONCEPTS_DIR if concepts_dir is None else concepts_dir
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    concepts_dir.mkdir(parents=True, exist_ok=True)
+    (wiki_dir / "index.md").write_text(_index_md(points, graph), encoding="utf-8")
+    for law, article in WIKI_SAMPLE_REFS:
+        hit = _resolve_concept(law, article, points)
+        if hit is None:
+            print(f"[wiki] 示例条文未命中，已跳过：《{law}》{article}")
+            continue
+        p = next((x for x in points if x.id == hit[0]), None)
+        if p is not None:
+            (concepts_dir / f"{p.id}.md").write_text(_concept_md(p, graph), encoding="utf-8")
+    (wiki_dir / "log.md").write_text(
         f"# 操作日志\n\n- {datetime.datetime.now():%Y-%m-%d %H:%M} 构建知识库，共 {len(points)} 个知识点，{len(graph['edges'])} 条关联。\n",
         encoding="utf-8",
     )

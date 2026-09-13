@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+/* ============ 设计令牌 ============
+   深色科技墨蓝 + 金：科技感来自深墨蓝底与细金线，法律严谨感来自衬线体法条正文
+   与克制的动效（不做花哨渐变/发光，避免削弱严肃性）。 */
+@theme {
+  /* 底色层次：墨蓝 → 稍亮的面板 → 边框 */
+  --color-ink-900: #070d18;
+  --color-ink-800: #0b1220;
+  --color-ink-700: #111b2e;
+  --color-ink-600: #17243c;
+  --color-ink-500: #21324f;
+  --color-line: #24344f;
+
+  /* 金色点缀（引用、强调、品牌线） */
+  --color-gold-400: #d8b978;
+  --color-gold-500: #c9a35c;
+  --color-gold-600: #a8843f;
+
+  /* 文字 */
+  --color-parchment: #eef2f8;
+  --color-muted: #9aa8c0;
+  --color-faint: #6b7a94;
+
+  /* 语义色（兜底提示、错误） */
+  --color-warn-400: #e0b070;
+  --color-danger-400: #d97b7b;
+  --color-ok-400: #7fd1a8;
+
+  /* 字体：UI 用无衬线，法条正文用衬线（中英文都落到衬线族） */
+  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-serif: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--color-ink-900);
+  color: var(--color-parchment);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 细金线分隔：法律文书的视觉语汇 */
+.gold-rule {
+  background: linear-gradient(90deg, var(--color-gold-500), transparent);
+  height: 1px;
+}
+
+/* 法条正文：衬线体 + 稍宽行距，接近法条文本的阅读感 */
+.legal-text { font-family: var(--font-serif); line-height: 1.85; }
+
+/* 流式光标：极克制的呼吸效果 */
+@keyframes caret { 0%, 49% { opacity: 1 } 50%, 100% { opacity: 0 } }
+.caret::after {
+  content: "▍";
+  margin-left: 2px;
+  color: var(--color-gold-400);
+  animation: caret 1.05s step-end infinite;
+}
+
+/* 细滚动条，避免亮色滚动条破坏深色基调 */
+* { scrollbar-width: thin; scrollbar-color: var(--color-ink-500) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--color-ink-500); border-radius: 4px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* markdown 渲染后的排版（回答正文） */
+.answer-body p { margin: 0 0 0.7em; }
+.answer-body ul, .answer-body ol { margin: 0.3em 0 0.8em; padding-left: 1.35em; }
+.answer-body li { margin: 0.22em 0; }
+.answer-body strong { color: var(--color-gold-400); font-weight: 600; }
+.answer-body h1, .answer-body h2, .answer-body h3 {
+  font-size: 1rem; margin: 0.9em 0 0.4em; color: var(--color-gold-400);
+}
+.answer-body code {
+  background: var(--color-ink-700); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.9em;
+}
+
+/* 表格（GFM）：外层容器负责横向滚动，避免宽表撑破气泡 */
+.answer-body .table-wrap { margin: 0.6em 0 0.9em; overflow-x: auto; }
+.answer-body table {
+  border-collapse: collapse; width: 100%; font-size: 0.92em;
+  font-family: var(--font-sans);      /* 表头/表体用无衬线，与法条正文区分 */
+}
+.answer-body th, .answer-body td {
+  border: 1px solid var(--color-line); padding: 0.45em 0.7em;
+  text-align: left; vertical-align: top;
+}
+.answer-body thead th {
+  background: var(--color-ink-700); color: var(--color-gold-400);
+  font-weight: 600; white-space: nowrap;
+}
+.answer-body tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--color-ink-700) 45%, transparent);
+}
+.answer-body blockquote {
+  margin: 0.6em 0; padding: 0.1em 0 0.1em 0.85em;
+  border-left: 2px solid var(--color-gold-600); color: var(--color-muted);
+}
